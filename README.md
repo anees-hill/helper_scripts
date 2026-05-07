@@ -1,4 +1,4 @@
-# helper_scriptcripts
+# helper_scripts
 
 Personal bootstrap scripts for setting up a fresh Ubuntu server.
 

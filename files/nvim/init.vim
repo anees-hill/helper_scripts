@@ -1,4 +1,4 @@
-et number
+set number
 set mouse=a
 set termguicolors
 set updatetime=250

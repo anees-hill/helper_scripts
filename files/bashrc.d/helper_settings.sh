@@ -1,4 +1,3 @@
-RS
 export EDITOR=vim
 # Alias'
 # General
