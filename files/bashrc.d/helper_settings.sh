@@ -1,3 +1,4 @@
+# VARS
 export EDITOR=vim
 # Alias'
 # General

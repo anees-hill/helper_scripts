@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 set -Eeuo pipefail
 
 TARGET_USER="samane"
@@ -268,15 +269,6 @@ install_nvim() {
   else
     echo "Warning: files/nvim/init.vim not found. Installed nvim binary only." >&2
   fi
-
-  run_as_user '
-    set -Eeuo pipefail
-
-    curl -fLo "${XDG_DATA_HOME:-$HOME/.local/share}"/nvim/site/autoload/plug.vim --create-dirs \
-      https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
-
-    echo "Installed vim-plug for nvim."
-  '
 
   echo "Installed nvim:"
   nvim --version | head -n 1
