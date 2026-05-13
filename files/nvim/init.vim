@@ -229,20 +229,26 @@ iron.setup({
     -- repl_open_cmd = 'leftabove 40vsplit',
     -- repl_open_cmd = 'leftabove 60vsplit',
     -- repl_open_cmd = 'rightbelow 40vsplit',
-    repl_open_cmd = 'belowright 15split',
+    repl_open_cmd = {
+          view.split.belowright(15),
+            view.split.vertical.rightbelow("40%"),
+    },
   },
-  keymaps = {
-    toggle_repl = "<leader>rr",
-    restart_repl = "<leader>rR",
-    send_motion = "<leader>sc",
-    visual_send = "<leader>sc",
-    send_file = "<leader>sf",
-    send_line = "<leader>sl",
-    send_paragraph = "<leader>sp",
-    send_until_cursor = "<leader>su",
-    send_code_block = "<leader>sb",
-    send_code_block_and_move = "<leader>sn",
-  },
+    keymaps = {
+      toggle_repl = "<leader>rr",
+      toggle_repl_with_cmd_1 = "<leader>rr",
+      toggle_repl_with_cmd_2 = "<leader>rv",
+
+      restart_repl = "<leader>rR",
+      send_motion = "<leader>sc",
+      visual_send = "<leader>sc",
+      send_file = "<leader>sf",
+      send_line = "<leader>sl",
+      send_paragraph = "<leader>sp",
+      send_until_cursor = "<leader>su",
+      send_code_block = "<leader>sb",
+      send_code_block_and_move = "<leader>sn",
+    },
 })
 
 vim.keymap.set('n', '<leader>rt', toggle_r)		
