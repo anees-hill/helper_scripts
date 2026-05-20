@@ -55,6 +55,7 @@ nnoremap <leader>ff :Telescope find_files<CR>
 nnoremap <leader>fg :Telescope live_grep<CR>
 nnoremap <leader>fb :Telescope buffers<CR>
 nnoremap <leader>fh :Telescope help_tags<CR>
+nnoremap <leader>E :NvimTreeFocus<CR>
 
 nnoremap <leader>gs :Git<CR>
 nnoremap <leader>gb :Git blame<CR>
@@ -111,6 +112,54 @@ local luasnip = require('luasnip')
 local iron = require('iron.core')
 local view = require('iron.view')
 local common = require('iron.fts.common')
+
+local safe_light_mode = false
+
+local function set_transparent_dark()
+  vim.o.background = "dark"
+
+  local groups = {
+    "Normal",
+    "NormalNC",
+    "SignColumn",
+    "EndOfBuffer",
+    "LineNr",
+    "StatusLine",
+    "StatusLineNC",
+  }
+
+  for _, group in ipairs(groups) do
+    vim.api.nvim_set_hl(0, group, { bg = "NONE" })
+  end
+
+  print("Theme mode: transparent dark")
+end
+
+local function set_safe_light()
+  vim.o.background = "light"
+
+  vim.api.nvim_set_hl(0, "Normal",       { fg = "#1f2328", bg = "#ffffff" })
+  vim.api.nvim_set_hl(0, "NormalNC",     { fg = "#1f2328", bg = "#ffffff" })
+  vim.api.nvim_set_hl(0, "SignColumn",   { fg = "#57606a", bg = "#ffffff" })
+  vim.api.nvim_set_hl(0, "EndOfBuffer",  { fg = "#ffffff", bg = "#ffffff" })
+  vim.api.nvim_set_hl(0, "LineNr",       { fg = "#6e7781", bg = "#ffffff" })
+  vim.api.nvim_set_hl(0, "StatusLine",   { fg = "#ffffff", bg = "#57606a" })
+  vim.api.nvim_set_hl(0, "StatusLineNC", { fg = "#57606a", bg = "#eaeef2" })
+
+  print("Theme mode: safe light")
+end
+
+local function toggle_safe_light()
+  safe_light_mode = not safe_light_mode
+
+  if safe_light_mode then
+    set_safe_light()
+  else
+    set_transparent_dark()
+  end
+end
+
+vim.keymap.set("n", "<leader>tl", toggle_safe_light, { desc = "Toggle safe light mode" })
 
 local function is_code_window(win)
   local buf = vim.api.nvim_win_get_buf(win)
