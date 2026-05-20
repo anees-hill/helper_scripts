@@ -113,7 +113,7 @@ local iron = require('iron.core')
 local view = require('iron.view')
 local common = require('iron.fts.common')
 
-local safe_light_mode = false
+local theme_state_file = vim.fn.stdpath("state") .. "/theme_mode"
 
 local function set_transparent_dark()
   vim.o.background = "dark"
@@ -132,6 +132,8 @@ local function set_transparent_dark()
     vim.api.nvim_set_hl(0, group, { bg = "NONE" })
   end
 
+  vim.fn.writefile({ "dark" }, theme_state_file)
+
   print("Theme mode: transparent dark")
 end
 
@@ -146,20 +148,44 @@ local function set_safe_light()
   vim.api.nvim_set_hl(0, "StatusLine",   { fg = "#ffffff", bg = "#57606a" })
   vim.api.nvim_set_hl(0, "StatusLineNC", { fg = "#57606a", bg = "#eaeef2" })
 
+  vim.fn.writefile({ "light" }, theme_state_file)
+
   print("Theme mode: safe light")
 end
 
 local function toggle_safe_light()
-  safe_light_mode = not safe_light_mode
+  local current = "dark"
 
-  if safe_light_mode then
+  if vim.fn.filereadable(theme_state_file) == 1 then
+    current = vim.fn.readfile(theme_state_file)[1]
+  end
+
+  if current == "dark" then
     set_safe_light()
   else
     set_transparent_dark()
   end
 end
 
-vim.keymap.set("n", "<leader>tl", toggle_safe_light, { desc = "Toggle safe light mode" })
+vim.keymap.set(
+  "n",
+  "<leader>tl",
+  toggle_safe_light,
+  { desc = "Toggle safe light mode" }
+)
+
+-- Restore saved theme mode on startup
+if vim.fn.filereadable(theme_state_file) == 1 then
+  local saved = vim.fn.readfile(theme_state_file)[1]
+
+  if saved == "light" then
+    set_safe_light()
+  else
+    set_transparent_dark()
+  end
+else
+  set_transparent_dark()
+end
 
 local function is_code_window(win)
   local buf = vim.api.nvim_win_get_buf(win)
