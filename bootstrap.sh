@@ -12,6 +12,7 @@ DO_BASHRC=0
 DO_PWRAP=0
 DO_NVIM=0
 DO_TOOLS=0
+DO_TMUX=0
 
 usage() {
   cat <<'EOF'
@@ -22,7 +23,7 @@ Profiles:
   --simple         Create user, install apt tools, uv, SSH key, bashrc settings, uv tools.
                    Does not install pwrap or nvim.
 
-  --ide            Everything in --simple, plus pwrap and nvim.
+  --ide            Everything in --simple, plus pwrap, nvim, and tmux
 
 Individual options:
   --user NAME      Target user. Default: samane.
@@ -33,7 +34,8 @@ Individual options:
   --bashrc        Install helper bashrc settings.
   --pwrap         Install pwrap prompt tools.
   --nvim          Install Neovim AppImage and init.vim.
-  --tools         Install Python/dev tools via uv.
+  --tool         Install Python/dev tools via uv.
+  --tmux          Install tmux and populate ~/.tmux.conf.
 
 Other:
   -h, --help      Show this help.
@@ -274,6 +276,33 @@ install_nvim() {
   nvim --version | head -n 1
 }
 
+install_tmux() {
+  ensure_user_exists
+
+  local user_home
+  user_home="$(home_for_user)"
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    apt update
+    apt install -y tmux
+  else
+    echo "tmux already installed: $(command -v tmux)"
+  fi
+
+  if [[ ! -f "$REPO_DIR/files/tmux/tmux.conf" ]]; then
+    echo "Missing file: files/tmux/tmux.conf" >&2
+    echo "Put your .tmux.conf there first." >&2
+    exit 1
+  fi
+
+  install -m 0644 -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$REPO_DIR/files/tmux/tmux.conf" \
+    "$user_home/.tmux.conf"
+
+  echo "Installed tmux config for $TARGET_USER:"
+  echo "  $user_home/.tmux.conf"
+}
+
 install_uv_tools() {
   ensure_user_exists
 
@@ -327,6 +356,7 @@ while [[ $# -gt 0 ]]; do
       DO_TOOLS=1
       DO_PWRAP=1
       DO_NVIM=1
+      DO_TMUX=1
       shift
       ;;
 
@@ -365,6 +395,11 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
 
+    --tmux)
+      DO_TMUX=1
+      shift
+      ;;
+
     --tools)
       DO_TOOLS=1
       shift
@@ -383,7 +418,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$DO_CREATE_USER$DO_APT$DO_UV$DO_SSH_KEY$DO_BASHRC$DO_PWRAP$DO_NVIM$DO_TOOLS" == "00000000" ]]; then
+if [[ "$DO_CREATE_USER$DO_APT$DO_UV$DO_SSH_KEY$DO_BASHRC$DO_PWRAP$DO_NVIM$DO_TOOLS$DO_TMUX" == "000000000" ]]; then
   usage
   exit 1
 fi
@@ -397,6 +432,7 @@ need_root
 [[ "$DO_BASHRC" -eq 1 ]] && install_bashrc_settings
 [[ "$DO_PWRAP" -eq 1 ]] && install_pwrap
 [[ "$DO_NVIM" -eq 1 ]] && install_nvim
+[[ "$DO_TMUX" -eq 1 ]] && install_tmux
 [[ "$DO_TOOLS" -eq 1 ]] && install_uv_tools
 
 echo
