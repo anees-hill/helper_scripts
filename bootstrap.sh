@@ -13,6 +13,7 @@ DO_PWRAP=0
 DO_NVIM=0
 DO_TOOLS=0
 DO_TMUX=0
+DO_VISIDATA=0
 
 usage() {
   cat <<'EOF'
@@ -23,7 +24,7 @@ Profiles:
   --simple         Create user, install apt tools, uv, SSH key, bashrc settings, uv tools.
                    Does not install pwrap or nvim.
 
-  --ide            Everything in --simple, plus pwrap, nvim, and tmux
+  --ide            Everything in --simple, plus pwrap, nvim, tmux and Visidata.
 
 Individual options:
   --user NAME      Target user. Default: samane.
@@ -36,6 +37,7 @@ Individual options:
   --nvim          Install Neovim AppImage and init.vim.
   --tool         Install Python/dev tools via uv.
   --tmux          Install tmux and populate ~/.tmux.conf.
+  --visidata     Install VisiData with PostgreSQL support.
 
 Other:
   -h, --help      Show this help.
@@ -204,6 +206,31 @@ install_bashrc_settings() {
     "$REPO_DIR/files/bashrc.d/helper_settings.sh" \
     "$user_home/.bashrc.d/helper_settings.sh"
 
+  if [[ ! -f "$user_home/.bashrc.d/bash_local.sh" ]]; then
+    cat > "$user_home/.bashrc.d/bash_local.sh" <<'EOF'
+# ~/.bashrc.d/bash_local.sh
+# Local shell customisations.
+# This file is created by helper_scripts but not overwritten.
+EOF
+
+    chown "$TARGET_USER:$TARGET_USER" "$user_home/.bashrc.d/bash_local.sh"
+    chmod 0644 "$user_home/.bashrc.d/bash_local.sh"
+  fi
+
+  if [[ ! -f "$user_home/.bashrc.d/vdb_connections" ]]; then
+    cat > "$user_home/.bashrc.d/vdb_connections" <<'EOF'
+# ~/.bashrc.d/vdb_connections
+# Local VisiData PostgreSQL connection aliases.
+# This file is private/local and should not be committed to Git.
+#
+# Example:
+# MYDB='postgres://user:password@IP:5432/mydbname'
+EOF
+
+    chown "$TARGET_USER:$TARGET_USER" "$user_home/.bashrc.d/vdb_connections"
+    chmod 0600 "$user_home/.bashrc.d/vdb_connections"
+  fi
+
   add_source_block \
     "$user_home/.bashrc" \
     "helper_settings" \
@@ -326,6 +353,32 @@ install_uv_tools() {
   '
 }
 
+install_visidata() {
+  ensure_user_exists
+
+  run_as_user '
+    set -Eeuo pipefail
+
+    export PATH="$HOME/.local/bin:$PATH"
+
+    if ! command -v uv >/dev/null 2>&1; then
+      echo "uv not found. Run --uv first." >&2
+      exit 1
+    fi
+
+    uv tool install --with psycopg2-binary visidata
+    uv tool update-shell
+
+    if command -v vd >/dev/null 2>&1; then
+      echo "Installed VisiData with PostgreSQL support:"
+      vd --version
+    else
+      echo "VisiData installed, but vd is not currently on PATH." >&2
+      echo "Open a new shell, or check that ~/.local/bin is on PATH." >&2
+    fi
+  '
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user)
@@ -357,6 +410,7 @@ while [[ $# -gt 0 ]]; do
       DO_PWRAP=1
       DO_NVIM=1
       DO_TMUX=1
+      DO_VISIDATA=1
       shift
       ;;
 
@@ -405,6 +459,11 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
 
+    --visidata)
+      DO_VISIDATA=1
+      shift
+      ;;
+   
     -h|--help)
       usage
       exit 0
@@ -418,7 +477,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$DO_CREATE_USER$DO_APT$DO_UV$DO_SSH_KEY$DO_BASHRC$DO_PWRAP$DO_NVIM$DO_TOOLS$DO_TMUX" == "000000000" ]]; then
+if [[ "$DO_CREATE_USER$DO_APT$DO_UV$DO_SSH_KEY$DO_BASHRC$DO_PWRAP$DO_NVIM$DO_TOOLS$DO_VISIDATA" == "000000000" ]]; then
   usage
   exit 1
 fi
@@ -434,6 +493,7 @@ need_root
 [[ "$DO_NVIM" -eq 1 ]] && install_nvim
 [[ "$DO_TMUX" -eq 1 ]] && install_tmux
 [[ "$DO_TOOLS" -eq 1 ]] && install_uv_tools
+[[ "$DO_VISIDATA" -eq 1 ]] && install_visidata
 
 echo
 echo "Bootstrap complete for user: $TARGET_USER"

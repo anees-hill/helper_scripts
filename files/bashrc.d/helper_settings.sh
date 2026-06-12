@@ -1,5 +1,11 @@
 # VARS
 export EDITOR=vim
+
+# Local private config files
+# helper_settings.sh is managed by helper_scripts.
+# Put machine-specific extras in ~/.bashrc.d/bash_local.sh.
+# Put VisiData database aliases in ~/.bashrc.d/vdb_connections.
+#
 # Alias'
 # General
 alias e='nvim'
@@ -118,6 +124,53 @@ _recent_file() {
 }
 
 # Shell fns
+vdb() {
+  local db_alias="${1:-}"
+  local schema="${2:-}"
+  local conn_file="$HOME/.bashrc.d/vdb_connections"
+  local conn_string=""
+
+  if [[ -z "$db_alias" || -z "$schema" ]]; then
+    echo "Usage: vdb DATABASE_ALIAS SCHEMA" >&2
+    echo "Example: vdb OPERA_PROD trf" >&2
+    return 1
+  fi
+
+  if ! command -v vd >/dev/null 2>&1; then
+    echo "vdb: vd command not found. Install with:" >&2
+    echo "  sudo bash bootstrap.sh --visidata" >&2
+    return 1
+  fi
+
+  if ! [[ "$db_alias" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "vdb: invalid database alias: $db_alias" >&2
+    return 1
+  fi
+
+  if [[ ! -f "$conn_file" ]]; then
+    echo "vdb: connection file not found: $conn_file" >&2
+    echo "Create it with entries like:" >&2
+    echo "  OPERA_PROD='postgres://user:password@host:5432/database'" >&2
+    return 1
+  fi
+
+  # shellcheck source=/dev/null
+  source "$conn_file"
+
+  conn_string="${!db_alias:-}"
+
+  if [[ -z "$conn_string" ]]; then
+    echo "vdb: no connection string found for alias: $db_alias" >&2
+    echo "Edit: $conn_file" >&2
+    echo "Expected something like:" >&2
+    echo "  ${db_alias}='postgres://user:password@host:5432/database'" >&2
+    return 1
+  fi
+
+  vd --postgres-schema="$schema" "$conn_string"
+}
+
+
 ltc() {
   local file=$(_recent_file "$1")
   [ -n "$file" ] && cat "$file"
@@ -180,3 +233,8 @@ ltw30() { loop-run 30 _lt_latest5; }
 ltw60() { loop-run 60 _lt_latest5; }
 alias ltw="ltw1"
 
+# Load local shell customisations last.
+# This file is intentionally not managed by helper_scripts after creation.
+if [[ -f "$HOME/.bashrc.d/bash_local.sh" ]]; then
+  source "$HOME/.bashrc.d/bash_local.sh"
+fi
