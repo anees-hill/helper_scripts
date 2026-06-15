@@ -10,6 +10,7 @@ DO_UV=0
 DO_SSH_KEY=0
 DO_BASHRC=0
 DO_PWRAP=0
+DO_PSYNC=0
 DO_NVIM=0
 DO_TOOLS=0
 DO_TMUX=0
@@ -34,6 +35,7 @@ Individual options:
   --ssh-key       Create ed25519 SSH key for target user, no passphrase.
   --bashrc        Install helper bashrc settings.
   --pwrap         Install pwrap prompt tools.
+  --psync         Install psync rsync schedule helper.
   --nvim          Install Neovim AppImage and init.vim.
   --tool         Install Python/dev tools via uv.
   --tmux          Install tmux and populate ~/.tmux.conf.
@@ -109,7 +111,9 @@ install_apt_packages() {
     ca-certificates \
     git \
     sudo \
-    ripgrep
+    ripgrep \
+    rsync \
+    python3
 
   if apt install -y eza; then
     echo "Installed eza."
@@ -353,6 +357,54 @@ install_uv_tools() {
   '
 }
 
+install_psync() {
+  ensure_user_exists
+
+  local user_home
+  user_home="$(home_for_user)"
+
+  if [[ ! -f "$REPO_DIR/files/bin/psync" ]]; then
+    echo "Missing file: files/bin/psync" >&2
+    echo "Put the psync script there first." >&2
+    exit 1
+  fi
+
+  if ! command -v rsync >/dev/null 2>&1; then
+    apt update
+    apt install -y rsync
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    apt update
+    apt install -y python3
+  fi
+
+  install -d -o "$TARGET_USER" -g "$TARGET_USER" "$user_home/.local/bin"
+
+  install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$REPO_DIR/files/bin/psync" \
+    "$user_home/.local/bin/psync"
+
+  local cmd
+  for cmd in \
+    psync_start \
+    psync_stop \
+    psync_status \
+    psync_adjust \
+    psync_now \
+    psync_log \
+    psync_remove \
+    psync_internal_scheduler
+  do
+    ln -sf "$user_home/.local/bin/psync" "$user_home/.local/bin/$cmd"
+    chown -h "$TARGET_USER:$TARGET_USER" "$user_home/.local/bin/$cmd" 2>/dev/null || true
+  done
+
+  echo "Installed psync commands to $user_home/.local/bin"
+  echo "Start the scheduler as $TARGET_USER with:"
+  echo "  psync_start"
+}
+
 install_visidata() {
   ensure_user_exists
 
@@ -444,6 +496,11 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
 
+    --psync)
+      DO_PSYNC=1
+      shift
+      ;;
+
     --nvim)
       DO_NVIM=1
       shift
@@ -477,7 +534,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$DO_CREATE_USER$DO_APT$DO_UV$DO_SSH_KEY$DO_BASHRC$DO_PWRAP$DO_NVIM$DO_TOOLS$DO_VISIDATA" == "000000000" ]]; then
+if [[ "$DO_CREATE_USER$DO_APT$DO_UV$DO_SSH_KEY$DO_BASHRC$DO_PWRAP$DO_PSYNC$DO_NVIM$DO_TOOLS$DO_VISIDATA" == "000000000" ]]; then
   usage
   exit 1
 fi
@@ -490,6 +547,7 @@ need_root
 [[ "$DO_SSH_KEY" -eq 1 ]] && install_ssh_key
 [[ "$DO_BASHRC" -eq 1 ]] && install_bashrc_settings
 [[ "$DO_PWRAP" -eq 1 ]] && install_pwrap
+[[ "$DO_PSYNC" -eq 1 ]] && install_psync
 [[ "$DO_NVIM" -eq 1 ]] && install_nvim
 [[ "$DO_TMUX" -eq 1 ]] && install_tmux
 [[ "$DO_TOOLS" -eq 1 ]] && install_uv_tools

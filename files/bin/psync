@@ -1,0 +1,861 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shlex
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+APP = "psync"
+DEFAULT_EVERY_SECONDS = 24 * 60 * 60
+MAX_CAPTURE_CHARS = 100_000
+
+
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def now_iso() -> str:
+    return now_utc().isoformat(timespec="seconds")
+
+
+def parse_iso(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def fmt_time(value: str | None) -> str:
+    parsed = parse_iso(value)
+    if parsed is None:
+        return "never"
+    return parsed.astimezone().strftime("%d-%m-%Y %H:%M:%S")
+
+
+def fmt_delta(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h {minutes % 60}m"
+    days = hours // 24
+    return f"{days}d {hours % 24}h"
+
+
+def parse_duration(text: str) -> int:
+    text = text.strip().lower()
+
+    units = [
+        ("seconds", 1),
+        ("second", 1),
+        ("secs", 1),
+        ("sec", 1),
+        ("s", 1),
+        ("minutes", 60),
+        ("minute", 60),
+        ("mins", 60),
+        ("min", 60),
+        ("m", 60),
+        ("hours", 3600),
+        ("hour", 3600),
+        ("hrs", 3600),
+        ("hr", 3600),
+        ("h", 3600),
+        ("days", 86400),
+        ("day", 86400),
+        ("d", 86400),
+    ]
+
+    for suffix, multiplier in units:
+        if text.endswith(suffix):
+            number = text[: -len(suffix)].strip()
+            if not number.isdigit():
+                raise ValueError(f"invalid duration: {text}")
+            value = int(number) * multiplier
+            if value <= 0:
+                raise ValueError("duration must be greater than zero")
+            return value
+
+    if text.isdigit():
+        value = int(text)
+        if value <= 0:
+            raise ValueError("duration must be greater than zero")
+        return value
+
+    raise ValueError(f"invalid duration: {text}")
+
+
+def quote_cmd(args: list[str]) -> str:
+    return " ".join(shlex.quote(arg) for arg in args)
+
+
+def config_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / APP
+
+
+def jobs_path() -> Path:
+    return config_dir() / "jobs.json"
+
+
+def runs_path() -> Path:
+    return state_dir() / "runs.sqlite"
+
+
+def ensure_dirs() -> None:
+    config_dir().mkdir(parents=True, exist_ok=True)
+    state_dir().mkdir(parents=True, exist_ok=True)
+    (Path.home() / ".config/systemd/user").mkdir(parents=True, exist_ok=True)
+
+
+def load_jobs() -> list[dict[str, Any]]:
+    path = jobs_path()
+    if not path.exists():
+        return []
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    jobs = data.get("jobs", [])
+    if not isinstance(jobs, list):
+        raise RuntimeError(f"Invalid jobs file: {path}")
+
+    return jobs
+
+
+def save_jobs(jobs: list[dict[str, Any]]) -> None:
+    ensure_dirs()
+    path = jobs_path()
+    tmp = path.with_suffix(".json.tmp")
+
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump({"jobs": jobs}, f, indent=2)
+        f.write("\n")
+
+    tmp.replace(path)
+
+
+def next_job_id(jobs: list[dict[str, Any]]) -> int:
+    if not jobs:
+        return 1
+    return max(int(job["id"]) for job in jobs) + 1
+
+
+def init_runs_db() -> None:
+    ensure_dirs()
+    with sqlite3.connect(runs_path()) as con:
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                exit_code INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                stdout TEXT NOT NULL,
+                stderr TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                trigger TEXT NOT NULL
+            )
+            """
+        )
+
+
+def truncate_text(text: str, max_chars: int = MAX_CAPTURE_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    return text[:max_chars] + f"\n\n[psync: truncated output; omitted {omitted} chars]\n"
+
+
+def summarise_output(output: str, exit_code: int) -> str:
+    if exit_code != 0:
+        for line in output.splitlines():
+            stripped = line.strip()
+            if stripped:
+                return stripped[:200]
+        return f"exit code {exit_code}"
+
+    for line in reversed(output.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if "bytes/sec" in lower or "speedup" in lower or "sent " in lower:
+            return stripped[:200]
+
+    if output.strip():
+        return "completed"
+    return "no output"
+
+
+def record_run(
+    *,
+    job_id: int,
+    started_at: str,
+    finished_at: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    trigger: str,
+) -> None:
+    init_runs_db()
+    status = "OK" if exit_code == 0 else "ERROR"
+    summary = summarise_output(stdout + "\n" + stderr, exit_code)
+
+    with sqlite3.connect(runs_path()) as con:
+        con.execute(
+            """
+            INSERT INTO runs (
+                job_id,
+                started_at,
+                finished_at,
+                exit_code,
+                status,
+                stdout,
+                stderr,
+                summary,
+                trigger
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                started_at,
+                finished_at,
+                exit_code,
+                status,
+                truncate_text(stdout),
+                truncate_text(stderr),
+                summary,
+                trigger,
+            ),
+        )
+
+
+def update_job_after_run(job_id: int, exit_code: int) -> None:
+    jobs = load_jobs()
+    for job in jobs:
+        if int(job["id"]) == job_id:
+            job["last_run_at"] = now_iso()
+            job["last_exit_code"] = exit_code
+            job["updated_at"] = now_iso()
+            break
+    save_jobs(jobs)
+
+
+def find_duplicate_job(
+    jobs: list[dict[str, Any]],
+    *,
+    cwd: str,
+    exec_command: list[str],
+) -> dict[str, Any] | None:
+    for job in jobs:
+        if job.get("working_directory") == cwd and job.get("exec_command") == exec_command:
+            return job
+    return None
+
+
+def create_or_find_job(rsync_args: list[str]) -> tuple[dict[str, Any], bool]:
+    ensure_dirs()
+    jobs = load_jobs()
+    cwd = str(Path.cwd().resolve())
+    exec_command = ["rsync", *rsync_args]
+
+    existing = find_duplicate_job(jobs, cwd=cwd, exec_command=exec_command)
+    if existing is not None:
+        return existing, False
+
+    job = {
+        "id": next_job_id(jobs),
+        "enabled": True,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "last_run_at": None,
+        "last_exit_code": None,
+        "every_seconds": DEFAULT_EVERY_SECONDS,
+        "working_directory": cwd,
+        "display_command": f"psync {quote_cmd(rsync_args)}",
+        "exec_command": exec_command,
+    }
+
+    jobs.append(job)
+    save_jobs(jobs)
+
+    return job, True
+
+
+def run_job(job: dict[str, Any], *, trigger: str, live: bool) -> int:
+    job_id = int(job["id"])
+    cwd = str(job["working_directory"])
+    exec_command = [str(part) for part in job["exec_command"]]
+
+    started_at = now_iso()
+
+    if live:
+        proc = subprocess.Popen(
+            exec_command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        captured_lines: list[str] = []
+        assert proc.stdout is not None
+
+        for line in proc.stdout:
+            print(line, end="")
+            captured_lines.append(line)
+
+        exit_code = proc.wait()
+        stdout = "".join(captured_lines)
+        stderr = ""
+    else:
+        proc = subprocess.run(
+            exec_command,
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        exit_code = proc.returncode
+        stdout = proc.stdout
+        stderr = proc.stderr
+
+        if stdout:
+            print(stdout, end="")
+        if stderr:
+            print(stderr, end="", file=sys.stderr)
+
+    finished_at = now_iso()
+
+    record_run(
+        job_id=job_id,
+        started_at=started_at,
+        finished_at=finished_at,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        trigger=trigger,
+    )
+    update_job_after_run(job_id, exit_code)
+
+    return exit_code
+
+
+def cmd_psync(args: list[str]) -> int:
+    if not args:
+        print("Usage: psync [rsync arguments...]", file=sys.stderr)
+        return 1
+
+    if args[0] in {"--help", "-h"}:
+        print("Usage: psync [rsync arguments...]")
+        print()
+        print("Example:")
+        print("  psync -azv server:/path/ .")
+        return 0
+
+    job, created = create_or_find_job(args)
+
+    if created:
+        print(f"psync: created job {job['id']} with schedule every 24h.")
+    else:
+        print(f"psync: matched existing job {job['id']}; schedule unchanged.")
+
+    exit_code = run_job(job, trigger="manual_psync", live=True)
+
+    if exit_code == 0:
+        print(f"psync: run completed OK for job {job['id']}.")
+    else:
+        print(f"psync: run failed for job {job['id']} with exit code {exit_code}.", file=sys.stderr)
+
+    return exit_code
+
+
+def due_time(job: dict[str, Any]) -> dt.datetime:
+    last_run = parse_iso(job.get("last_run_at"))
+    every = int(job.get("every_seconds", DEFAULT_EVERY_SECONDS))
+
+    if last_run is None:
+        return now_utc()
+
+    return last_run + dt.timedelta(seconds=every)
+
+
+def is_due(job: dict[str, Any]) -> bool:
+    if not bool(job.get("enabled", True)):
+        return False
+    return due_time(job) <= now_utc()
+
+
+def cmd_scheduler() -> int:
+    ensure_dirs()
+    jobs = load_jobs()
+    due_jobs = [job for job in jobs if is_due(job)]
+    due_jobs.sort(key=due_time)
+
+    if not due_jobs:
+        print("psync scheduler: no jobs due.")
+        return 0
+
+    worst_exit = 0
+
+    for job in due_jobs:
+        print(f"psync scheduler: running job {job['id']}")
+        exit_code = run_job(job, trigger="scheduler", live=False)
+        if exit_code != 0 and worst_exit == 0:
+            worst_exit = exit_code
+
+    return worst_exit
+
+
+def systemctl_user(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["systemctl", "--user", *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def installed_psync_path() -> Path:
+    return Path.home() / ".local/bin/psync_internal_scheduler"
+
+
+def write_systemd_units() -> None:
+    ensure_dirs()
+    unit_dir = Path.home() / ".config/systemd/user"
+    service = unit_dir / "psync.service"
+    timer = unit_dir / "psync.timer"
+
+    service_content = f"""[Unit]
+Description=psync scheduler
+
+[Service]
+Type=oneshot
+ExecStart={installed_psync_path()}
+"""
+
+    timer_content = """[Unit]
+Description=Run psync scheduler periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+    if not service.exists() or service.read_text(encoding="utf-8") != service_content:
+        service.write_text(service_content, encoding="utf-8")
+
+    if not timer.exists() or timer.read_text(encoding="utf-8") != timer_content:
+        timer.write_text(timer_content, encoding="utf-8")
+
+
+def cmd_start() -> int:
+    write_systemd_units()
+
+    daemon = systemctl_user("daemon-reload")
+    if daemon.returncode != 0:
+        print(daemon.stderr.strip(), file=sys.stderr)
+        print()
+        print("psync_start: could not talk to user systemd.", file=sys.stderr)
+        print("If this is a server session, try logging in as the target user first.", file=sys.stderr)
+        print("For always-on user timers, root can run: loginctl enable-linger USER", file=sys.stderr)
+        return daemon.returncode
+
+    result = systemctl_user("enable", "--now", "psync.timer")
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+
+    print("psync service is ACTIVE.")
+    print("Timer installed at ~/.config/systemd/user/psync.timer")
+    return 0
+
+
+def cmd_stop() -> int:
+    result = systemctl_user("disable", "--now", "psync.timer")
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        return result.returncode
+
+    print("psync service is INACTIVE.")
+    return 0
+
+
+def service_state() -> str:
+    result = systemctl_user("is-active", "psync.timer")
+    if result.returncode == 0 and result.stdout.strip() == "active":
+        return "ACTIVE"
+    return "INACTIVE"
+
+
+def latest_run_for_job(job_id: int) -> dict[str, Any] | None:
+    init_runs_db()
+    with sqlite3.connect(runs_path()) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            """
+            SELECT *
+            FROM runs
+            WHERE job_id = ?
+            ORDER BY run_id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+
+    return dict(row) if row is not None else None
+
+
+def print_jobs(jobs: list[dict[str, Any]]) -> None:
+    print("Jobs:")
+
+    if not jobs:
+        print("  none")
+        return
+
+    for job in sorted(jobs, key=lambda item: int(item["id"])):
+        job_id = int(job["id"])
+        enabled = "ON " if job.get("enabled", True) else "OFF"
+        every = fmt_delta(int(job.get("every_seconds", DEFAULT_EVERY_SECONDS)))
+        last = latest_run_for_job(job_id)
+
+        if last is None:
+            last_text = "last never"
+        else:
+            status = str(last["status"]).lower()
+            last_text = f"last {status} {fmt_time(last['finished_at'])}"
+
+        print(f"{job_id}: {enabled}  every {every:<8} {last_text}")
+        print(f"   {job.get('display_command', quote_cmd(job.get('exec_command', [])))}")
+
+
+def upcoming_events(jobs: list[dict[str, Any]], *, limit: int, entry: int | None) -> list[tuple[dt.datetime, dict[str, Any]]]:
+    events: list[tuple[dt.datetime, dict[str, Any]]] = []
+
+    selected = [
+        job
+        for job in jobs
+        if job.get("enabled", True) and (entry is None or int(job["id"]) == entry)
+    ]
+
+    for job in selected:
+        every = int(job.get("every_seconds", DEFAULT_EVERY_SECONDS))
+        next_due = due_time(job)
+
+        while next_due < now_utc():
+            next_due += dt.timedelta(seconds=every)
+
+        for i in range(limit):
+            events.append((next_due + dt.timedelta(seconds=every * i), job))
+
+    events.sort(key=lambda item: item[0])
+    return events[:limit]
+
+
+def cmd_status(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="psync_status")
+    parser.add_argument("--schedule", action="store_true")
+    parser.add_argument("--next", type=int, default=10)
+    parser.add_argument("--entry", type=int)
+    ns = parser.parse_args(argv)
+
+    jobs = load_jobs()
+
+    if ns.schedule:
+        events = upcoming_events(jobs, limit=ns.next, entry=ns.entry)
+        print("Upcoming psync jobs:")
+        print()
+
+        if not events:
+            print("  none")
+            return 0
+
+        for i, (when, job) in enumerate(events, start=1):
+            seconds = int((when - now_utc()).total_seconds())
+            print(
+                f"{i}. {when.astimezone().strftime('%d-%m-%Y %H:%M:%S')}  "
+                f"entry {job['id']}  in {fmt_delta(seconds)}"
+            )
+            print(f"   {job.get('display_command')}")
+            print()
+
+        return 0
+
+    state = service_state()
+    print(f"The psync service is {state}.")
+    if state == "ACTIVE":
+        print("Use psync_stop to pause ongoing synchronisation.")
+    else:
+        print("Use psync_start to commence ongoing synchronisation.")
+    print()
+
+    print_jobs(jobs)
+    print()
+
+    print("Scheduler:")
+    if state != "ACTIVE":
+        print("  not running")
+    else:
+        events = upcoming_events(jobs, limit=5, entry=None)
+        if not events:
+            print("  no enabled jobs")
+        else:
+            for when, job in events:
+                seconds = int((when - now_utc()).total_seconds())
+                print(
+                    f"  entry {job['id']}: next due "
+                    f"{when.astimezone().strftime('%d-%m-%Y %H:%M:%S')} "
+                    f"(in {fmt_delta(seconds)})"
+                )
+
+    return 0
+
+
+def find_job_by_id(job_id: int) -> dict[str, Any] | None:
+    for job in load_jobs():
+        if int(job["id"]) == job_id:
+            return job
+    return None
+
+
+def cmd_adjust(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="psync_adjust")
+    parser.add_argument("--entry", type=int, required=True)
+    parser.add_argument("--every")
+    parser.add_argument("--on", action="store_true")
+    parser.add_argument("--off", action="store_true")
+    ns = parser.parse_args(argv)
+
+    if ns.on and ns.off:
+        print("psync_adjust: use only one of --on or --off", file=sys.stderr)
+        return 1
+
+    jobs = load_jobs()
+    changed = False
+
+    for job in jobs:
+        if int(job["id"]) != ns.entry:
+            continue
+
+        if ns.every:
+            try:
+                job["every_seconds"] = parse_duration(ns.every)
+            except ValueError as exc:
+                print(f"psync_adjust: {exc}", file=sys.stderr)
+                return 1
+            changed = True
+
+        if ns.on:
+            job["enabled"] = True
+            changed = True
+
+        if ns.off:
+            job["enabled"] = False
+            changed = True
+
+        job["updated_at"] = now_iso()
+        break
+    else:
+        print(f"psync_adjust: no such entry: {ns.entry}", file=sys.stderr)
+        return 1
+
+    if not changed:
+        print("psync_adjust: nothing to change.", file=sys.stderr)
+        return 1
+
+    save_jobs(jobs)
+    print(f"Updated psync entry {ns.entry}.")
+    return 0
+
+
+def cmd_now(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="psync_now")
+    parser.add_argument("--entry", type=int)
+    ns = parser.parse_args(argv)
+
+    jobs = load_jobs()
+
+    if ns.entry is not None:
+        selected = [job for job in jobs if int(job["id"]) == ns.entry]
+        if not selected:
+            print(f"psync_now: no such entry: {ns.entry}", file=sys.stderr)
+            return 1
+    else:
+        selected = [job for job in jobs if job.get("enabled", True)]
+
+    if not selected:
+        print("psync_now: no jobs to run.")
+        return 0
+
+    worst_exit = 0
+
+    for job in selected:
+        print(f"psync_now: running entry {job['id']}")
+        exit_code = run_job(job, trigger="manual_now", live=True)
+        if exit_code != 0 and worst_exit == 0:
+            worst_exit = exit_code
+
+    return worst_exit
+
+
+def cmd_log(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="psync_log")
+    parser.add_argument("--entry", type=int)
+    parser.add_argument("--errors", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--lines", type=int, default=10)
+    ns = parser.parse_args(argv)
+
+    init_runs_db()
+
+    where: list[str] = []
+    params: list[Any] = []
+
+    if ns.entry is not None:
+        where.append("job_id = ?")
+        params.append(ns.entry)
+
+    if ns.errors:
+        where.append("status = 'ERROR'")
+
+    where_sql = ""
+    if where:
+        where_sql = "WHERE " + " AND ".join(where)
+
+    params.append(ns.lines)
+
+    with sqlite3.connect(runs_path()) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            f"""
+            SELECT *
+            FROM runs
+            {where_sql}
+            ORDER BY run_id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+    print("Recent psync runs:")
+    print()
+
+    if not rows:
+        print("  none")
+        return 0
+
+    for row in rows:
+        status = row["status"]
+        when = fmt_time(row["finished_at"])
+        print(
+            f"{status:<5}  {when}  entry {row['job_id']}  "
+            f"{row['summary']}"
+        )
+
+        if ns.verbose:
+            stdout = row["stdout"]
+            stderr = row["stderr"]
+
+            if stdout:
+                print("stdout:")
+                print(stdout.rstrip())
+            if stderr:
+                print("stderr:")
+                print(stderr.rstrip())
+
+        print()
+
+    return 0
+
+
+def cmd_remove(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="psync_remove")
+    parser.add_argument("--entry", type=int, required=True)
+    parser.add_argument("--yes", "-y", action="store_true")
+    ns = parser.parse_args(argv)
+
+    jobs = load_jobs()
+    job = next((item for item in jobs if int(item["id"]) == ns.entry), None)
+
+    if job is None:
+        print(f"psync_remove: no such entry: {ns.entry}", file=sys.stderr)
+        return 1
+
+    if not ns.yes:
+        print(f"Remove psync entry {ns.entry}?")
+        print(f"  {job.get('display_command')}")
+        reply = input("Continue? [y/N] ").strip().lower()
+        if reply not in {"y", "yes"}:
+            print("Cancelled.")
+            return 1
+
+    jobs = [item for item in jobs if int(item["id"]) != ns.entry]
+    save_jobs(jobs)
+
+    print(f"Removed psync entry {ns.entry}.")
+    return 0
+
+
+def dispatch() -> int:
+    name = Path(sys.argv[0]).name
+    args = sys.argv[1:]
+
+    if name == "psync":
+        return cmd_psync(args)
+    if name == "psync_start":
+        return cmd_start()
+    if name == "psync_stop":
+        return cmd_stop()
+    if name == "psync_status":
+        return cmd_status(args)
+    if name == "psync_adjust":
+        return cmd_adjust(args)
+    if name == "psync_now":
+        return cmd_now(args)
+    if name == "psync_log":
+        return cmd_log(args)
+    if name == "psync_remove":
+        return cmd_remove(args)
+    if name == "psync_internal_scheduler":
+        return cmd_scheduler()
+
+    print(f"Unknown psync command name: {name}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(dispatch())
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        raise SystemExit(130)

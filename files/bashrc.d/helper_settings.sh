@@ -1,5 +1,6 @@
 # VARS
 export EDITOR=vim
+export PATH="$HOME/.local/bin:$PATH"
 
 # Local private config files
 # helper_settings.sh is managed by helper_scripts.
