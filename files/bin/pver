@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+APP = "helper_scripts"
+
+COMPONENTS = [
+    "core",
+    "bashrc",
+    "pwrap",
+    "psync",
+    "nvim",
+    "tmux",
+    "tools",
+    "visidata",
+]
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def config_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / APP
+
+
+def manifest_path() -> Path:
+    return config_dir() / "install.json"
+
+
+def load_manifest() -> dict[str, Any]:
+    path = manifest_path()
+
+    if not path.exists():
+        return {
+            "repo_dir": None,
+            "installed_at": None,
+            "updated_at": None,
+            "version": None,
+            "user": os.environ.get("USER"),
+            "components": {},
+        }
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    data.setdefault("components", {})
+    return data
+
+
+def save_manifest(data: dict[str, Any]) -> None:
+    config_dir().mkdir(parents=True, exist_ok=True)
+    path = manifest_path()
+    tmp = path.with_suffix(".json.tmp")
+
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+    tmp.replace(path)
+
+
+def read_version(repo_dir: Path | None) -> str | None:
+    if repo_dir is None:
+        return None
+
+    version_file = repo_dir / "VERSION"
+    if not version_file.exists():
+        return None
+
+    return version_file.read_text(encoding="utf-8").strip()
+
+
+def run_git(repo_dir: Path, *args: str) -> str | None:
+    proc = subprocess.run(
+        ["git", "-C", str(repo_dir), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if proc.returncode != 0:
+        return None
+
+    return proc.stdout.strip()
+
+
+def guess_repo_dir(existing: str | None = None) -> Path | None:
+    candidates: list[Path] = []
+
+    if existing:
+        candidates.append(Path(existing).expanduser())
+
+    candidates.extend(
+        [
+            Path.cwd(),
+            Path.home() / "helper_scripts",
+        ]
+    )
+
+    for candidate in candidates:
+        if (candidate / "bootstrap.sh").exists() and (candidate / "files").exists():
+            return candidate.resolve()
+
+    return None
+
+
+def component_flags(data: dict[str, Any]) -> list[str]:
+    components = data.get("components", {})
+    flags: list[str] = []
+
+    mapping = {
+        "core": "--core",
+        "bashrc": "--bashrc",
+        "pwrap": "--pwrap",
+        "psync": "--psync",
+        "nvim": "--nvim",
+        "tmux": "--tmux",
+        "tools": "--tools",
+        "visidata": "--visidata",
+    }
+
+    for component in COMPONENTS:
+        if components.get(component):
+            flags.append(mapping[component])
+
+    return flags
+
+
+def cmd_pver(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="pver")
+    parser.add_argument("--json", action="store_true")
+    ns = parser.parse_args(argv)
+
+    data = load_manifest()
+    repo_dir_raw = data.get("repo_dir")
+    repo_dir = Path(repo_dir_raw).expanduser() if repo_dir_raw else None
+
+    version = read_version(repo_dir)
+    branch = run_git(repo_dir, "branch", "--show-current") if repo_dir else None
+    commit = run_git(repo_dir, "rev-parse", "--short", "HEAD") if repo_dir else None
+    status = run_git(repo_dir, "status", "--short") if repo_dir else None
+
+    result = {
+        "version": version or data.get("version") or "unknown",
+        "manifest": str(manifest_path()),
+        "repo_dir": str(repo_dir) if repo_dir else None,
+        "branch": branch,
+        "commit": commit,
+        "dirty": bool(status),
+        "user": data.get("user"),
+        "components": sorted(
+            [
+                name
+                for name, enabled in data.get("components", {}).items()
+                if enabled
+            ]
+        ),
+    }
+
+    if ns.json:
+        print(json.dumps(result, indent=2))
+        return 0
+
+    print(f"helper_scripts {result['version']}")
+    print(f"manifest: {result['manifest']}")
+
+    if result["repo_dir"]:
+        print(f"repo:     {result['repo_dir']}")
+    else:
+        print("repo:     not registered")
+
+    if result["branch"] or result["commit"]:
+        dirty = " dirty" if result["dirty"] else ""
+        print(f"git:      {result['branch'] or '?'} @ {result['commit'] or '?'}{dirty}")
+
+    components = result["components"]
+    if components:
+        print(f"installed components: {', '.join(components)}")
+    else:
+        print("installed components: none registered")
+
+    return 0
+
+
+def cmd_pregister(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="pregister")
+    parser.add_argument("--repo-dir")
+    parser.add_argument("--all", action="store_true")
+
+    for component in COMPONENTS:
+        parser.add_argument(f"--{component}", action="store_true")
+
+    ns = parser.parse_args(argv)
+
+    data = load_manifest()
+    repo_dir = guess_repo_dir(ns.repo_dir or data.get("repo_dir"))
+
+    if repo_dir is None:
+        print("pregister: could not find helper_scripts repo.", file=sys.stderr)
+        print("Use: pregister --repo-dir /path/to/helper_scripts --core ...", file=sys.stderr)
+        return 1
+
+    selected = {
+        component
+        for component in COMPONENTS
+        if getattr(ns, component)
+    }
+
+    if ns.all:
+        selected.update(COMPONENTS)
+
+    if not selected:
+        print("pregister: no components selected.", file=sys.stderr)
+        print("Example: pregister --core --bashrc --pwrap --tmux", file=sys.stderr)
+        return 1
+
+    components = data.setdefault("components", {})
+
+    for component in selected:
+        components[component] = True
+
+    data["repo_dir"] = str(repo_dir)
+    data["version"] = read_version(repo_dir)
+    data["user"] = os.environ.get("USER")
+    data["updated_at"] = now_iso()
+
+    if not data.get("installed_at"):
+        data["installed_at"] = data["updated_at"]
+
+    save_manifest(data)
+
+    print(f"Registered helper_scripts repo: {repo_dir}")
+    print(f"Registered components: {', '.join(sorted(selected))}")
+    print(f"Manifest: {manifest_path()}")
+
+    return 0
+
+
+def cmd_pupdate(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="pupdate")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-pull", action="store_true")
+    parser.add_argument("--user", default=os.environ.get("USER"))
+    ns = parser.parse_args(argv)
+
+    data = load_manifest()
+
+    if not data.get("repo_dir"):
+        print("pupdate: no helper_scripts repo registered.", file=sys.stderr)
+        print("Run pregister first, for example:", file=sys.stderr)
+        print("  pregister --core --bashrc --pwrap --tmux", file=sys.stderr)
+        return 1
+
+    repo_dir = Path(data["repo_dir"]).expanduser()
+
+    if not repo_dir.exists():
+        print(f"pupdate: repo does not exist: {repo_dir}", file=sys.stderr)
+        return 1
+
+    flags = component_flags(data)
+
+    if not flags:
+        print("pupdate: no registered components to update.", file=sys.stderr)
+        return 1
+
+    commands: list[list[str]] = []
+
+    if not ns.no_pull:
+        commands.append(["git", "-C", str(repo_dir), "pull"])
+
+    commands.append(
+        [
+            "sudo",
+            "bash",
+            str(repo_dir / "bootstrap.sh"),
+            "--user",
+            str(ns.user),
+            *flags,
+        ]
+    )
+
+    if ns.dry_run:
+        print("pupdate dry run:")
+        for cmd in commands:
+            print("  " + quote_command(cmd))
+        return 0
+
+    for cmd in commands:
+        print("+ " + quote_command(cmd))
+        proc = subprocess.run(cmd)
+        if proc.returncode != 0:
+            return proc.returncode
+
+    refreshed = load_manifest()
+    refreshed["repo_dir"] = str(repo_dir)
+    refreshed["version"] = read_version(repo_dir)
+    refreshed["updated_at"] = now_iso()
+    save_manifest(refreshed)
+
+    print("pupdate complete.")
+    return 0
+
+
+def quote_command(cmd: list[str]) -> str:
+    return " ".join(shlex_quote(part) for part in cmd)
+
+
+def shlex_quote(value: str) -> str:
+    import shlex
+
+    return shlex.quote(value)
+
+
+def dispatch() -> int:
+    name = Path(sys.argv[0]).name
+    args = sys.argv[1:]
+
+    if name == "pver":
+        return cmd_pver(args)
+    if name == "pregister":
+        return cmd_pregister(args)
+    if name == "pupdate":
+        return cmd_pupdate(args)
+
+    print(f"Unknown command name: {name}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(dispatch())

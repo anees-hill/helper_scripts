@@ -9,6 +9,7 @@ DO_APT=0
 DO_UV=0
 DO_SSH_KEY=0
 DO_BASHRC=0
+DO_CORE=0
 DO_PWRAP=0
 DO_PSYNC=0
 DO_NVIM=0
@@ -22,10 +23,10 @@ Usage:
   sudo bash bootstrap.sh [options]
 
 Profiles:
-  --simple         Create user, install apt tools, uv, SSH key, bashrc settings, uv tools.
+  --simple         Create user, install apt tools, uv, SSH key, core helpers, bashrc settings, uv tools.
                    Does not install pwrap or nvim.
 
-  --ide            Everything in --simple, plus pwrap, nvim, tmux and Visidata.
+  --ide            Everything in --simple, plus pwrap, nvim, tmux, core helpers and Visidata.
 
 Individual options:
   --user NAME      Target user. Default: samane.
@@ -34,6 +35,7 @@ Individual options:
   --uv            Install uv for target user.
   --ssh-key       Create ed25519 SSH key for target user, no passphrase.
   --bashrc        Install helper bashrc settings.
+  --core          Install pver, pregister and pupdate.
   --pwrap         Install pwrap prompt tools.
   --psync         Install psync rsync schedule helper.
   --nvim          Install Neovim AppImage and init.vim.
@@ -101,6 +103,111 @@ create_user() {
   usermod -aG sudo "$TARGET_USER"
 
   echo "Created user '$TARGET_USER' and added to sudo group."
+}
+
+helper_config_dir_for_user() {
+  local user_home
+  user_home="$(home_for_user)"
+  printf '%s/.config/helper_scripts' "$user_home"
+}
+
+helper_manifest_for_user() {
+  printf '%s/install.json' "$(helper_config_dir_for_user)"
+}
+
+helper_version() {
+  if [[ -f "$REPO_DIR/VERSION" ]]; then
+    tr -d '\r\n' < "$REPO_DIR/VERSION"
+  else
+    printf 'unknown'
+  fi
+}
+
+record_component() {
+  local component="$1"
+
+  ensure_user_exists
+
+  local user_home config_dir manifest version
+  user_home="$(home_for_user)"
+  config_dir="$(helper_config_dir_for_user)"
+  manifest="$(helper_manifest_for_user)"
+  version="$(helper_version)"
+
+  install -d -o "$TARGET_USER" -g "$TARGET_USER" "$config_dir"
+
+  sudo -H -u "$TARGET_USER" python3 - "$manifest" "$REPO_DIR" "$version" "$component" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+manifest = Path(sys.argv[1])
+repo_dir = sys.argv[2]
+version = sys.argv[3]
+component = sys.argv[4]
+
+now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+if manifest.exists():
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+else:
+    data = {
+        "installed_at": now,
+        "components": {},
+    }
+
+data["repo_dir"] = repo_dir
+data["version"] = version
+data["user"] = os.environ.get("USER")
+data["updated_at"] = now
+data.setdefault("installed_at", now)
+data.setdefault("components", {})
+data["components"][component] = True
+
+manifest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+PY
+
+  chown "$TARGET_USER:$TARGET_USER" "$manifest"
+}
+
+install_core() {
+  ensure_user_exists
+
+  local user_home
+  user_home="$(home_for_user)"
+
+  if [[ ! -f "$REPO_DIR/files/bin/pver" ]]; then
+    echo "Missing file: files/bin/pver" >&2
+    exit 1
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    apt update
+    apt install -y python3
+  fi
+
+  install -d -o "$TARGET_USER" -g "$TARGET_USER" "$user_home/.local/bin"
+
+  install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$REPO_DIR/files/bin/pver" \
+    "$user_home/.local/bin/pver"
+
+  sed -i 's/\r$//' "$user_home/.local/bin/pver"
+
+  local cmd
+  for cmd in pregister pupdate; do
+    ln -sf "$user_home/.local/bin/pver" "$user_home/.local/bin/$cmd"
+    chown -h "$TARGET_USER:$TARGET_USER" "$user_home/.local/bin/$cmd" 2>/dev/null || true
+  done
+
+  record_component "core"
+
+  echo "Installed helper_scripts core commands:"
+  echo "  pver"
+  echo "  pregister"
+  echo "  pupdate"
 }
 
 install_apt_packages() {
@@ -242,6 +349,8 @@ EOF
 
   chown "$TARGET_USER:$TARGET_USER" "$user_home/.bashrc"
 
+  record_component "bashrc"
+
   echo "Installed helper bashrc settings."
 }
 
@@ -269,6 +378,8 @@ install_pwrap() {
     "\$HOME/.bashrc.d/prompt_tools.sh"
 
   chown "$TARGET_USER:$TARGET_USER" "$user_home/.bashrc"
+
+  record_component "pwrap"
 
   echo "Installed pwrap prompt tools."
 }
@@ -303,6 +414,19 @@ install_nvim() {
     echo "Warning: files/nvim/init.vim not found. Installed nvim binary only." >&2
   fi
 
+  if [[ -f "$user_home/.config/nvim/init.vim" ]]; then
+    sed -i 's/\r$//' "$user_home/.config/nvim/init.vim"
+  fi
+
+  sudo -H -u "$TARGET_USER" bash -lc '
+    set -Eeuo pipefail
+
+    curl -fLo "${XDG_DATA_HOME:-$HOME/.local/share}"/nvim/site/autoload/plug.vim --create-dirs \
+      https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+  '
+
+  record_component "nvim"
+
   echo "Installed nvim:"
   nvim --version | head -n 1
 }
@@ -330,6 +454,8 @@ install_tmux() {
     "$REPO_DIR/files/tmux/tmux.conf" \
     "$user_home/.tmux.conf"
 
+  record_component "tmux"
+
   echo "Installed tmux config for $TARGET_USER:"
   echo "  $user_home/.tmux.conf"
 }
@@ -355,6 +481,7 @@ install_uv_tools() {
 
     echo "Installed uv tools."
   '
+    record_component "tools"
 }
 
 install_psync() {
@@ -385,6 +512,8 @@ install_psync() {
     "$REPO_DIR/files/bin/psync" \
     "$user_home/.local/bin/psync"
 
+  sed -i 's/\r$//' "$user_home/.local/bin/psync"
+
   local cmd
   for cmd in \
     psync_start \
@@ -394,11 +523,14 @@ install_psync() {
     psync_now \
     psync_log \
     psync_remove \
+    psync_host \
     psync_internal_scheduler
   do
     ln -sf "$user_home/.local/bin/psync" "$user_home/.local/bin/$cmd"
     chown -h "$TARGET_USER:$TARGET_USER" "$user_home/.local/bin/$cmd" 2>/dev/null || true
   done
+
+  record_component "psync"
 
   echo "Installed psync commands to $user_home/.local/bin"
   echo "Start the scheduler as $TARGET_USER with:"
@@ -429,6 +561,7 @@ install_visidata() {
       echo "Open a new shell, or check that ~/.local/bin is on PATH." >&2
     fi
   '
+  record_component "visidata"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -448,6 +581,7 @@ while [[ $# -gt 0 ]]; do
       DO_UV=1
       DO_SSH_KEY=1
       DO_BASHRC=1
+      DO_CORE=1
       DO_TOOLS=1
       shift
       ;;
@@ -458,6 +592,7 @@ while [[ $# -gt 0 ]]; do
       DO_UV=1
       DO_SSH_KEY=1
       DO_BASHRC=1
+      DO_CORE=1
       DO_TOOLS=1
       DO_PWRAP=1
       DO_NVIM=1
@@ -488,6 +623,11 @@ while [[ $# -gt 0 ]]; do
 
     --bashrc)
       DO_BASHRC=1
+      shift
+      ;;
+
+    --core)
+      DO_CORE=1
       shift
       ;;
 
@@ -534,7 +674,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$DO_CREATE_USER$DO_APT$DO_UV$DO_SSH_KEY$DO_BASHRC$DO_PWRAP$DO_PSYNC$DO_NVIM$DO_TOOLS$DO_VISIDATA" == "000000000" ]]; then
+if (( DO_CREATE_USER + DO_APT + DO_UV + DO_SSH_KEY + DO_BASHRC + DO_CORE + DO_PWRAP + DO_PSYNC + DO_NVIM + DO_TOOLS + DO_TMUX + DO_VISIDATA == 0 )); then
   usage
   exit 1
 fi
@@ -546,6 +686,7 @@ need_root
 [[ "$DO_UV" -eq 1 ]] && install_uv
 [[ "$DO_SSH_KEY" -eq 1 ]] && install_ssh_key
 [[ "$DO_BASHRC" -eq 1 ]] && install_bashrc_settings
+[[ "$DO_CORE" -eq 1 ]] && install_core
 [[ "$DO_PWRAP" -eq 1 ]] && install_pwrap
 [[ "$DO_PSYNC" -eq 1 ]] && install_psync
 [[ "$DO_NVIM" -eq 1 ]] && install_nvim

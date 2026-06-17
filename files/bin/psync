@@ -5,17 +5,29 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shlex
 import sqlite3
+import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 
 APP = "psync"
 DEFAULT_EVERY_SECONDS = 24 * 60 * 60
 MAX_CAPTURE_CHARS = 100_000
+HOST_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+@dataclass(slots=True)
+class RunResult:
+    started_at: str
+    finished_at: str
+    exit_code: int
+    stdout: str
+    stderr: str
 
 
 def now_utc() -> dt.datetime:
@@ -102,6 +114,164 @@ def parse_duration(text: str) -> int:
     raise ValueError(f"invalid duration: {text}")
 
 
+def parse_at_time(text: str) -> str:
+    text = text.strip()
+
+    match = re.match(r"^([01]?[0-9]|2[0-3]):([0-5][0-9])$", text)
+    if not match:
+        raise ValueError("time must be HH:MM, for example 11:00 or 23:30")
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+
+    return f"{hour:02d}:{minute:02d}"
+
+
+def parse_psync_invocation(args: list[str]) -> tuple[dict[str, Any], list[str]]:
+    meta: dict[str, Any] = {
+        "versions_keep": None,
+        "use_link_dest": True,
+    }
+
+    if not args:
+        return meta, args
+
+    # Keep normal rsync-style usage transparent:
+    #   psync -azv source dest
+    #
+    # psync-specific options require:
+    #   psync --versions 3 -- -azv source dest
+    if not (
+        args[0] == "--versions"
+        or args[0].startswith("--versions=")
+        or args[0] == "--no-link-dest"
+    ):
+        return meta, args
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+
+        if arg == "--":
+            return meta, args[i + 1 :]
+
+        if arg == "--versions":
+            if i + 1 >= len(args):
+                raise ValueError("--versions requires a number")
+            try:
+                versions = int(args[i + 1])
+            except ValueError as exc:
+                raise ValueError("--versions requires a positive integer") from exc
+            if versions < 1:
+                raise ValueError("--versions must be at least 1")
+            meta["versions_keep"] = versions
+            i += 2
+            continue
+
+        if arg.startswith("--versions="):
+            value = arg.split("=", 1)[1]
+            try:
+                versions = int(value)
+            except ValueError as exc:
+                raise ValueError("--versions requires a positive integer") from exc
+            if versions < 1:
+                raise ValueError("--versions must be at least 1")
+            meta["versions_keep"] = versions
+            i += 1
+            continue
+
+        if arg == "--no-link-dest":
+            meta["use_link_dest"] = False
+            i += 1
+            continue
+
+        raise ValueError(f"unknown psync option before --: {arg}")
+
+    raise ValueError("psync options require -- before rsync arguments")
+
+
+def local_destination_root(dest: str, cwd: str) -> Path:
+    if remote_host_from_arg(dest) is not None:
+        raise ValueError(
+            "versioned psync currently requires a local destination directory"
+        )
+
+    path = Path(dest).expanduser()
+
+    if not path.is_absolute():
+        path = Path(cwd) / path
+
+    return path.resolve()
+
+
+def version_timestamp() -> str:
+    return dt.datetime.now().astimezone().strftime("%Y-%m-%d_%H%M%S")
+
+
+def version_dirs(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+
+    pattern = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}(?:-\d+)?$")
+
+    return sorted(
+        [item for item in root.iterdir() if item.is_dir() and pattern.match(item.name)],
+        key=lambda item: item.name,
+    )
+
+
+def next_version_dir(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+
+    base = version_timestamp()
+    candidate = root / base
+
+    if not candidate.exists():
+        return candidate
+
+    for i in range(1, 1000):
+        candidate = root / f"{base}-{i:03d}"
+        if not candidate.exists():
+            return candidate
+
+    raise RuntimeError("could not create a unique version directory")
+
+
+def prune_old_versions(root: Path, keep: int) -> list[Path]:
+    removed: list[Path] = []
+    dirs = version_dirs(root)
+
+    if len(dirs) <= keep:
+        return removed
+
+    for old in dirs[: len(dirs) - keep]:
+        shutil.rmtree(old)
+        removed.append(old)
+
+    return removed
+
+
+def make_job_signature(
+    *,
+    job_type: str,
+    cwd: str,
+    exec_command: list[str] | None = None,
+    rsync_args_base: list[str] | None = None,
+    version_root: str | None = None,
+    versions_keep: int | None = None,
+    use_link_dest: bool | None = None,
+) -> dict[str, Any]:
+    return {
+        "job_type": job_type,
+        "working_directory": cwd,
+        "exec_command": exec_command,
+        "rsync_args_base": rsync_args_base,
+        "version_root": version_root,
+        "versions_keep": versions_keep,
+        "use_link_dest": use_link_dest,
+    }
+
+
 def quote_cmd(args: list[str]) -> str:
     return " ".join(shlex.quote(arg) for arg in args)
 
@@ -118,41 +288,133 @@ def jobs_path() -> Path:
     return config_dir() / "jobs.json"
 
 
+def hosts_path() -> Path:
+    return config_dir() / "hosts.json"
+
+
 def runs_path() -> Path:
     return state_dir() / "runs.sqlite"
+
+
+def psync_ssh_dir() -> Path:
+    return config_dir() / "ssh"
+
+
+def psync_keys_dir() -> Path:
+    return psync_ssh_dir() / "keys"
+
+
+def psync_ssh_config_path() -> Path:
+    return psync_ssh_dir() / "config"
 
 
 def ensure_dirs() -> None:
     config_dir().mkdir(parents=True, exist_ok=True)
     state_dir().mkdir(parents=True, exist_ok=True)
+    psync_keys_dir().mkdir(parents=True, exist_ok=True)
     (Path.home() / ".config/systemd/user").mkdir(parents=True, exist_ok=True)
 
 
-def load_jobs() -> list[dict[str, Any]]:
-    path = jobs_path()
+def load_json_file(path: Path, key: str) -> list[dict[str, Any]]:
     if not path.exists():
         return []
 
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
-    jobs = data.get("jobs", [])
-    if not isinstance(jobs, list):
-        raise RuntimeError(f"Invalid jobs file: {path}")
+    items = data.get(key, [])
+    if not isinstance(items, list):
+        raise RuntimeError(f"Invalid file: {path}")
 
-    return jobs
+    return items
 
 
-def save_jobs(jobs: list[dict[str, Any]]) -> None:
+def save_json_file(path: Path, key: str, items: list[dict[str, Any]]) -> None:
     ensure_dirs()
-    path = jobs_path()
-    tmp = path.with_suffix(".json.tmp")
+    tmp = path.with_suffix(path.suffix + ".tmp")
 
     with tmp.open("w", encoding="utf-8") as f:
-        json.dump({"jobs": jobs}, f, indent=2)
+        json.dump({key: items}, f, indent=2)
         f.write("\n")
 
     tmp.replace(path)
+
+
+def load_jobs() -> list[dict[str, Any]]:
+    return load_json_file(jobs_path(), "jobs")
+
+
+def save_jobs(jobs: list[dict[str, Any]]) -> None:
+    save_json_file(jobs_path(), "jobs", jobs)
+
+
+def load_hosts() -> list[dict[str, Any]]:
+    return load_json_file(hosts_path(), "hosts")
+
+
+def save_hosts(hosts: list[dict[str, Any]]) -> None:
+    save_json_file(hosts_path(), "hosts", hosts)
+    write_psync_ssh_config(hosts)
+
+
+def host_by_name(name: str) -> dict[str, Any] | None:
+    for host in load_hosts():
+        if host["name"] == name:
+            return host
+    return None
+
+
+def validate_host_name(name: str) -> None:
+    if not HOST_NAME_RE.match(name):
+        raise ValueError(
+            "host name may only contain letters, numbers, underscore, dash and dot"
+        )
+
+
+def write_psync_ssh_config(hosts: list[dict[str, Any]]) -> None:
+    ensure_dirs()
+    config = psync_ssh_config_path()
+
+    lines: list[str] = [
+        "# Generated by psync. Do not edit by hand.",
+        "# Use psync_host add/remove instead.",
+        "",
+    ]
+
+    for host in sorted(hosts, key=lambda h: h["name"]):
+        lines.append(f"Host {host['name']}")
+        lines.append(f"  HostName {host['host']}")
+        lines.append(f"  User {host['user']}")
+        if host.get("port"):
+            lines.append(f"  Port {host['port']}")
+        lines.append(f"  IdentityFile {host['identity_file']}")
+        lines.append("  IdentitiesOnly yes")
+        lines.append("  BatchMode yes")
+        lines.append("  StrictHostKeyChecking accept-new")
+        lines.append("")
+
+    config.write_text("\n".join(lines), encoding="utf-8")
+    config.chmod(0o600)
+
+
+def public_key_text(identity_file: str) -> str:
+    private_key = Path(identity_file).expanduser()
+
+    pub_file = Path(str(private_key) + ".pub")
+    if pub_file.exists():
+        return pub_file.read_text(encoding="utf-8").strip()
+
+    proc = subprocess.run(
+        ["ssh-keygen", "-y", "-f", str(private_key)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "could not derive public key")
+
+    return proc.stdout.strip()
 
 
 def next_job_id(jobs: list[dict[str, Any]]) -> int:
@@ -164,8 +426,7 @@ def next_job_id(jobs: list[dict[str, Any]]) -> int:
 def init_runs_db() -> None:
     ensure_dirs()
     with sqlite3.connect(runs_path()) as con:
-        con.execute(
-            """
+        con.execute("""
             CREATE TABLE IF NOT EXISTS runs (
                 run_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 job_id INTEGER NOT NULL,
@@ -178,15 +439,16 @@ def init_runs_db() -> None:
                 summary TEXT NOT NULL,
                 trigger TEXT NOT NULL
             )
-            """
-        )
+            """)
 
 
 def truncate_text(text: str, max_chars: int = MAX_CAPTURE_CHARS) -> str:
     if len(text) <= max_chars:
         return text
     omitted = len(text) - max_chars
-    return text[:max_chars] + f"\n\n[psync: truncated output; omitted {omitted} chars]\n"
+    return (
+        text[:max_chars] + f"\n\n[psync: truncated output; omitted {omitted} chars]\n"
+    )
 
 
 def summarise_output(output: str, exit_code: int) -> str:
@@ -202,7 +464,7 @@ def summarise_output(output: str, exit_code: int) -> str:
         if not stripped:
             continue
         lower = stripped.lower()
-        if "bytes/sec" in lower or "speedup" in lower or "sent " in lower:
+        if "bytes/sec" in lower or "speedup" in lower or lower.startswith("sent "):
             return stripped[:200]
 
     if output.strip():
@@ -254,12 +516,12 @@ def record_run(
         )
 
 
-def update_job_after_run(job_id: int, exit_code: int) -> None:
+def update_job_after_run(job_id: int, result: RunResult) -> None:
     jobs = load_jobs()
     for job in jobs:
         if int(job["id"]) == job_id:
-            job["last_run_at"] = now_iso()
-            job["last_exit_code"] = exit_code
+            job["last_run_at"] = result.finished_at
+            job["last_exit_code"] = result.exit_code
             job["updated_at"] = now_iso()
             break
     save_jobs(jobs)
@@ -269,54 +531,180 @@ def find_duplicate_job(
     jobs: list[dict[str, Any]],
     *,
     cwd: str,
-    exec_command: list[str],
+    exec_command: list[str] | None = None,
+    signature: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
+    if signature is not None:
+        for job in jobs:
+            if job.get("signature") == signature:
+                return job
+
+    if exec_command is None:
+        return None
+
     for job in jobs:
-        if job.get("working_directory") == cwd and job.get("exec_command") == exec_command:
+        if (
+            job.get("working_directory") == cwd
+            and job.get("exec_command") == exec_command
+        ):
             return job
+
     return None
 
 
-def create_or_find_job(rsync_args: list[str]) -> tuple[dict[str, Any], bool]:
-    ensure_dirs()
+def create_job(
+    *,
+    rsync_args: list[str],
+    exec_command: list[str],
+    cwd: str,
+) -> dict[str, Any]:
     jobs = load_jobs()
-    cwd = str(Path.cwd().resolve())
-    exec_command = ["rsync", *rsync_args]
 
-    existing = find_duplicate_job(jobs, cwd=cwd, exec_command=exec_command)
-    if existing is not None:
-        return existing, False
+    signature = make_job_signature(
+        job_type="normal",
+        cwd=cwd,
+        exec_command=exec_command,
+    )
 
     job = {
         "id": next_job_id(jobs),
+        "job_type": "normal",
         "enabled": True,
         "created_at": now_iso(),
         "updated_at": now_iso(),
         "last_run_at": None,
         "last_exit_code": None,
         "every_seconds": DEFAULT_EVERY_SECONDS,
+        "at_time": None,
         "working_directory": cwd,
         "display_command": f"psync {quote_cmd(rsync_args)}",
         "exec_command": exec_command,
+        "signature": signature,
     }
 
     jobs.append(job)
     save_jobs(jobs)
+    return job
 
-    return job, True
+
+def create_versioned_job(
+    *,
+    original_rsync_args: list[str],
+    rsync_args_base: list[str],
+    version_root: str,
+    versions_keep: int,
+    use_link_dest: bool,
+    cwd: str,
+) -> dict[str, Any]:
+    jobs = load_jobs()
+
+    signature = make_job_signature(
+        job_type="versioned",
+        cwd=cwd,
+        rsync_args_base=rsync_args_base,
+        version_root=version_root,
+        versions_keep=versions_keep,
+        use_link_dest=use_link_dest,
+    )
+
+    job = {
+        "id": next_job_id(jobs),
+        "job_type": "versioned",
+        "enabled": True,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "last_run_at": None,
+        "last_exit_code": None,
+        "every_seconds": DEFAULT_EVERY_SECONDS,
+        "at_time": None,
+        "working_directory": cwd,
+        "display_command": f"psync --versions {versions_keep} -- {quote_cmd(original_rsync_args)}",
+        "exec_command": [],
+        "rsync_args_base": rsync_args_base,
+        "version_root": version_root,
+        "versions_keep": versions_keep,
+        "use_link_dest": use_link_dest,
+        "signature": signature,
+    }
+
+    jobs.append(job)
+    save_jobs(jobs)
+    return job
 
 
-def run_job(job: dict[str, Any], *, trigger: str, live: bool) -> int:
-    job_id = int(job["id"])
-    cwd = str(job["working_directory"])
-    exec_command = [str(part) for part in job["exec_command"]]
+def has_explicit_rsh(rsync_args: list[str]) -> bool:
+    for arg in rsync_args:
+        if arg == "-e":
+            return True
+        if arg.startswith("--rsh"):
+            return True
+    return False
 
+
+def remote_host_from_arg(arg: str) -> str | None:
+    if arg.startswith("-"):
+        return None
+    if "://" in arg:
+        return None
+    if "::" in arg:
+        return None
+    if ":" not in arg:
+        return None
+
+    before_colon = arg.split(":", 1)[0]
+    if "/" in before_colon:
+        return None
+
+    if "@" in before_colon:
+        before_colon = before_colon.rsplit("@", 1)[1]
+
+    if not before_colon:
+        return None
+
+    return before_colon
+
+
+def remote_hosts_from_args(rsync_args: list[str]) -> list[str]:
+    hosts: list[str] = []
+    for arg in rsync_args:
+        host = remote_host_from_arg(arg)
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def build_exec_command(rsync_args: list[str]) -> list[str]:
+    if has_explicit_rsh(rsync_args):
+        return ["rsync", *rsync_args]
+
+    remote_hosts = remote_hosts_from_args(rsync_args)
+    if not remote_hosts:
+        return ["rsync", *rsync_args]
+
+    psync_hosts = {host["name"] for host in load_hosts()}
+
+    if any(host in psync_hosts for host in remote_hosts):
+        ssh_cmd = f"ssh -F {shlex.quote(str(psync_ssh_config_path()))}"
+        return ["rsync", "-e", ssh_cmd, *rsync_args]
+
+    # For normal SSH rsync, avoid password prompts/hangs.
+    # This keeps scheduled jobs non-interactive.
+    return ["rsync", "-e", "ssh -o BatchMode=yes", *rsync_args]
+
+
+def run_exec_command(
+    *,
+    exec_command: list[str],
+    cwd: str,
+    live: bool,
+) -> RunResult:
     started_at = now_iso()
 
     if live:
         proc = subprocess.Popen(
             exec_command,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -337,6 +725,7 @@ def run_job(job: dict[str, Any], *, trigger: str, live: bool) -> int:
         proc = subprocess.run(
             exec_command,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -352,52 +741,341 @@ def run_job(job: dict[str, Any], *, trigger: str, live: bool) -> int:
 
     finished_at = now_iso()
 
-    record_run(
-        job_id=job_id,
+    return RunResult(
         started_at=started_at,
         finished_at=finished_at,
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
+    )
+
+
+def build_versioned_exec_command(
+    *,
+    rsync_args_base: list[str],
+    version_root: str,
+    use_link_dest: bool,
+) -> tuple[list[str], Path]:
+    root = Path(version_root).expanduser().resolve()
+    previous_versions = version_dirs(root)
+
+    previous = previous_versions[-1] if previous_versions else None
+    current = next_version_dir(root)
+    current.mkdir(parents=True, exist_ok=False)
+
+    dynamic_args = list(rsync_args_base)
+
+    if use_link_dest and previous is not None:
+        dynamic_args = [f"--link-dest={previous}", *dynamic_args]
+
+    dynamic_args.append(str(current) + "/")
+
+    return build_exec_command(dynamic_args), current
+
+
+def run_versioned_once(
+    *,
+    rsync_args_base: list[str],
+    version_root: str,
+    versions_keep: int,
+    use_link_dest: bool,
+    cwd: str,
+    live: bool,
+) -> tuple[RunResult, Path, list[Path]]:
+    exec_command, version_dir = build_versioned_exec_command(
+        rsync_args_base=rsync_args_base,
+        version_root=version_root,
+        use_link_dest=use_link_dest,
+    )
+
+    result = run_exec_command(
+        exec_command=exec_command,
+        cwd=cwd,
+        live=live,
+    )
+
+    removed: list[Path] = []
+
+    if result.exit_code == 0:
+        removed = prune_old_versions(Path(version_root), versions_keep)
+    else:
+        # If rsync failed before writing anything useful, clean up the empty version dir.
+        try:
+            if version_dir.exists() and not any(version_dir.iterdir()):
+                version_dir.rmdir()
+        except OSError:
+            pass
+
+    return result, version_dir, removed
+
+
+def run_versioned_job(job: dict[str, Any], *, trigger: str, live: bool) -> int:
+    job_id = int(job["id"])
+    cwd = str(job["working_directory"])
+
+    result, version_dir, removed = run_versioned_once(
+        rsync_args_base=[str(part) for part in job["rsync_args_base"]],
+        version_root=str(job["version_root"]),
+        versions_keep=int(job["versions_keep"]),
+        use_link_dest=bool(job.get("use_link_dest", True)),
+        cwd=cwd,
+        live=live,
+    )
+
+    record_run(
+        job_id=job_id,
+        started_at=result.started_at,
+        finished_at=result.finished_at,
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
         trigger=trigger,
     )
-    update_job_after_run(job_id, exit_code)
+    update_job_after_run(job_id, result)
 
-    return exit_code
+    if result.exit_code == 0:
+        print(f"psync: created version {version_dir}")
+        for old in removed:
+            print(f"psync: removed old version {old}")
+
+    return result.exit_code
+
+
+def run_job(job: dict[str, Any], *, trigger: str, live: bool) -> int:
+    if job.get("job_type") == "versioned":
+        return run_versioned_job(job, trigger=trigger, live=live)
+
+    job_id = int(job["id"])
+    cwd = str(job["working_directory"])
+    exec_command = [str(part) for part in job["exec_command"]]
+
+    result = run_exec_command(exec_command=exec_command, cwd=cwd, live=live)
+
+    record_run(
+        job_id=job_id,
+        started_at=result.started_at,
+        finished_at=result.finished_at,
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        trigger=trigger,
+    )
+    update_job_after_run(job_id, result)
+
+    return result.exit_code
 
 
 def cmd_psync(args: list[str]) -> int:
     if not args:
         print("Usage: psync [rsync arguments...]", file=sys.stderr)
+        print("       psync --versions N -- [rsync arguments...]", file=sys.stderr)
         return 1
 
     if args[0] in {"--help", "-h"}:
-        print("Usage: psync [rsync arguments...]")
+        print("Usage:")
+        print("  psync [rsync arguments...]")
+        print("  psync --versions N -- [rsync arguments...]")
         print()
-        print("Example:")
+        print("Examples:")
         print("  psync -azv server:/path/ .")
+        print("  psync --versions 3 -- -azv server:/path/ ./backups/")
         return 0
 
-    job, created = create_or_find_job(args)
+    try:
+        meta, rsync_args = parse_psync_invocation(args)
+    except ValueError as exc:
+        print(f"psync: {exc}", file=sys.stderr)
+        return 1
 
-    if created:
-        print(f"psync: created job {job['id']} with schedule every 24h.")
-    else:
-        print(f"psync: matched existing job {job['id']}; schedule unchanged.")
+    if not rsync_args:
+        print("psync: no rsync arguments supplied.", file=sys.stderr)
+        return 1
 
-    exit_code = run_job(job, trigger="manual_psync", live=True)
+    ensure_dirs()
 
-    if exit_code == 0:
+    cwd = str(Path.cwd().resolve())
+    versions_keep = meta.get("versions_keep")
+
+    if versions_keep is not None:
+        if len(rsync_args) < 2:
+            print(
+                "psync: versioned mode needs at least source and destination.",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            version_root = str(local_destination_root(rsync_args[-1], cwd))
+        except ValueError as exc:
+            print(f"psync: {exc}", file=sys.stderr)
+            return 1
+
+        rsync_args_base = rsync_args[:-1]
+        use_link_dest = bool(meta.get("use_link_dest", True))
+
+        signature = make_job_signature(
+            job_type="versioned",
+            cwd=cwd,
+            rsync_args_base=rsync_args_base,
+            version_root=version_root,
+            versions_keep=int(versions_keep),
+            use_link_dest=use_link_dest,
+        )
+
+        jobs = load_jobs()
+        existing = find_duplicate_job(jobs, cwd=cwd, signature=signature)
+
+        if existing is not None:
+            print(
+                f"psync: matched existing versioned job {existing['id']}; schedule unchanged."
+            )
+            exit_code = run_job(existing, trigger="manual_psync", live=True)
+
+            if exit_code == 0:
+                print(f"psync: run completed OK for job {existing['id']}.")
+            else:
+                print(
+                    f"psync: run failed for job {existing['id']} with exit code {exit_code}.",
+                    file=sys.stderr,
+                )
+
+            return exit_code
+
+        print("psync: no existing versioned job matched.")
+        print("psync: running rsync once before saving as a scheduled versioned job.")
+
+        result, version_dir, removed = run_versioned_once(
+            rsync_args_base=rsync_args_base,
+            version_root=version_root,
+            versions_keep=int(versions_keep),
+            use_link_dest=use_link_dest,
+            cwd=cwd,
+            live=True,
+        )
+
+        if result.exit_code != 0:
+            print(
+                f"psync: rsync failed with exit code {result.exit_code}.",
+                file=sys.stderr,
+            )
+            print("psync: no job was created.", file=sys.stderr)
+            return result.exit_code
+
+        job = create_versioned_job(
+            original_rsync_args=rsync_args,
+            rsync_args_base=rsync_args_base,
+            version_root=version_root,
+            versions_keep=int(versions_keep),
+            use_link_dest=use_link_dest,
+            cwd=cwd,
+        )
+
+        record_run(
+            job_id=int(job["id"]),
+            started_at=result.started_at,
+            finished_at=result.finished_at,
+            exit_code=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            trigger="manual_psync",
+        )
+        update_job_after_run(int(job["id"]), result)
+
+        print(f"psync: created version {version_dir}")
+        for old in removed:
+            print(f"psync: removed old version {old}")
+
+        print(f"psync: created versioned job {job['id']} with schedule every 24h.")
         print(f"psync: run completed OK for job {job['id']}.")
-    else:
-        print(f"psync: run failed for job {job['id']} with exit code {exit_code}.", file=sys.stderr)
+        return 0
 
-    return exit_code
+    exec_command = build_exec_command(rsync_args)
+
+    jobs = load_jobs()
+    signature = make_job_signature(
+        job_type="normal",
+        cwd=cwd,
+        exec_command=exec_command,
+    )
+    existing = find_duplicate_job(
+        jobs,
+        cwd=cwd,
+        exec_command=exec_command,
+        signature=signature,
+    )
+
+    if existing is not None:
+        print(f"psync: matched existing job {existing['id']}; schedule unchanged.")
+        exit_code = run_job(existing, trigger="manual_psync", live=True)
+
+        if exit_code == 0:
+            print(f"psync: run completed OK for job {existing['id']}.")
+        else:
+            print(
+                f"psync: run failed for job {existing['id']} with exit code {exit_code}.",
+                file=sys.stderr,
+            )
+
+        return exit_code
+
+    print("psync: no existing job matched.")
+    print("psync: running rsync once before saving as a scheduled job.")
+
+    result = run_exec_command(exec_command=exec_command, cwd=cwd, live=True)
+
+    if result.exit_code != 0:
+        print(
+            f"psync: rsync failed with exit code {result.exit_code}.",
+            file=sys.stderr,
+        )
+        print("psync: no job was created.", file=sys.stderr)
+        return result.exit_code
+
+    job = create_job(rsync_args=rsync_args, exec_command=exec_command, cwd=cwd)
+
+    record_run(
+        job_id=int(job["id"]),
+        started_at=result.started_at,
+        finished_at=result.finished_at,
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        trigger="manual_psync",
+    )
+    update_job_after_run(int(job["id"]), result)
+
+    print(f"psync: created job {job['id']} with schedule every 24h.")
+    print(f"psync: run completed OK for job {job['id']}.")
+    return 0
 
 
 def due_time(job: dict[str, Any]) -> dt.datetime:
     last_run = parse_iso(job.get("last_run_at"))
     every = int(job.get("every_seconds", DEFAULT_EVERY_SECONDS))
+    at_time = job.get("at_time")
+
+    if at_time and every >= 86400:
+        at_time = parse_at_time(str(at_time))
+        hour, minute = [int(part) for part in at_time.split(":")]
+
+        now_local = dt.datetime.now().astimezone()
+        days = max(1, every // 86400)
+
+        if last_run is None:
+            candidate_date = now_local.date()
+        else:
+            candidate_date = last_run.astimezone().date() + dt.timedelta(days=days)
+
+        candidate = dt.datetime.combine(
+            candidate_date,
+            dt.time(hour=hour, minute=minute),
+            tzinfo=now_local.tzinfo,
+        )
+
+        while candidate <= now_local:
+            candidate += dt.timedelta(days=days)
+
+        return candidate.astimezone(dt.timezone.utc)
 
     if last_run is None:
         return now_utc()
@@ -487,8 +1165,14 @@ def cmd_start() -> int:
         print(daemon.stderr.strip(), file=sys.stderr)
         print()
         print("psync_start: could not talk to user systemd.", file=sys.stderr)
-        print("If this is a server session, try logging in as the target user first.", file=sys.stderr)
-        print("For always-on user timers, root can run: loginctl enable-linger USER", file=sys.stderr)
+        print(
+            "If this is a server session, try logging in as the target user first.",
+            file=sys.stderr,
+        )
+        print(
+            "For always-on user timers, root can run: loginctl enable-linger USER",
+            file=sys.stderr,
+        )
         return daemon.returncode
 
     result = systemctl_user("enable", "--now", "psync.timer")
@@ -547,6 +1231,10 @@ def print_jobs(jobs: list[dict[str, Any]]) -> None:
         job_id = int(job["id"])
         enabled = "ON " if job.get("enabled", True) else "OFF"
         every = fmt_delta(int(job.get("every_seconds", DEFAULT_EVERY_SECONDS)))
+        schedule = f"every {every}"
+
+        if job.get("at_time"):
+            schedule += f" at {job['at_time']}"
         last = latest_run_for_job(job_id)
 
         if last is None:
@@ -555,11 +1243,18 @@ def print_jobs(jobs: list[dict[str, Any]]) -> None:
             status = str(last["status"]).lower()
             last_text = f"last {status} {fmt_time(last['finished_at'])}"
 
-        print(f"{job_id}: {enabled}  every {every:<8} {last_text}")
-        print(f"   {job.get('display_command', quote_cmd(job.get('exec_command', [])))}")
+        print(f"{job_id}: {enabled}  {schedule:<20} {last_text}")
+        print(
+            f"   {job.get('display_command', quote_cmd(job.get('exec_command', [])))}"
+        )
 
 
-def upcoming_events(jobs: list[dict[str, Any]], *, limit: int, entry: int | None) -> list[tuple[dt.datetime, dict[str, Any]]]:
+def upcoming_events(
+    jobs: list[dict[str, Any]],
+    *,
+    limit: int,
+    entry: int | None,
+) -> list[tuple[dt.datetime, dict[str, Any]]]:
     events: list[tuple[dt.datetime, dict[str, Any]]] = []
 
     selected = [
@@ -641,23 +1336,22 @@ def cmd_status(argv: list[str]) -> int:
     return 0
 
 
-def find_job_by_id(job_id: int) -> dict[str, Any] | None:
-    for job in load_jobs():
-        if int(job["id"]) == job_id:
-            return job
-    return None
-
-
 def cmd_adjust(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="psync_adjust")
     parser.add_argument("--entry", type=int, required=True)
     parser.add_argument("--every")
+    parser.add_argument("--at")
+    parser.add_argument("--clear-at", action="store_true")
     parser.add_argument("--on", action="store_true")
     parser.add_argument("--off", action="store_true")
     ns = parser.parse_args(argv)
 
     if ns.on and ns.off:
         print("psync_adjust: use only one of --on or --off", file=sys.stderr)
+        return 1
+
+    if ns.at and ns.clear_at:
+        print("psync_adjust: use only one of --at or --clear-at", file=sys.stderr)
         return 1
 
     jobs = load_jobs()
@@ -667,12 +1361,36 @@ def cmd_adjust(argv: list[str]) -> int:
         if int(job["id"]) != ns.entry:
             continue
 
+        target_every = int(job.get("every_seconds", DEFAULT_EVERY_SECONDS))
+
         if ns.every:
             try:
-                job["every_seconds"] = parse_duration(ns.every)
+                target_every = parse_duration(ns.every)
             except ValueError as exc:
                 print(f"psync_adjust: {exc}", file=sys.stderr)
                 return 1
+
+            job["every_seconds"] = target_every
+            changed = True
+
+        if ns.at:
+            try:
+                job["at_time"] = parse_at_time(ns.at)
+            except ValueError as exc:
+                print(f"psync_adjust: {exc}", file=sys.stderr)
+                return 1
+
+            if target_every < 86400:
+                print(
+                    "psync_adjust: --at requires --every of at least 1d / 24h.",
+                    file=sys.stderr,
+                )
+                return 1
+
+            changed = True
+
+        if ns.clear_at:
+            job["at_time"] = None
             changed = True
 
         if ns.on:
@@ -777,10 +1495,7 @@ def cmd_log(argv: list[str]) -> int:
     for row in rows:
         status = row["status"]
         when = fmt_time(row["finished_at"])
-        print(
-            f"{status:<5}  {when}  entry {row['job_id']}  "
-            f"{row['summary']}"
-        )
+        print(f"{status:<5}  {when}  entry {row['job_id']}  " f"{row['summary']}")
 
         if ns.verbose:
             stdout = row["stdout"]
@@ -826,6 +1541,268 @@ def cmd_remove(argv: list[str]) -> int:
     return 0
 
 
+def cmd_host(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="psync_host")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add")
+    p_add.add_argument("name")
+    p_add.add_argument("--host", required=True)
+    p_add.add_argument("--user", required=True)
+    p_add.add_argument("--port")
+    p_add.add_argument("--identity-file")
+    p_add.add_argument("--force", action="store_true")
+
+    p_list = sub.add_parser("list")
+
+    p_show = sub.add_parser("show")
+    p_show.add_argument("name")
+
+    p_show_key = sub.add_parser("show-key")
+    p_show_key.add_argument("name")
+
+    p_install_key = sub.add_parser("install-key")
+    p_install_key.add_argument("name")
+
+    p_test = sub.add_parser("test")
+    p_test.add_argument("name")
+
+    p_remove = sub.add_parser("remove")
+    p_remove.add_argument("name")
+    p_remove.add_argument("--yes", "-y", action="store_true")
+    p_remove.add_argument("--delete-key", action="store_true")
+
+    ns = parser.parse_args(argv)
+
+    if ns.command == "add":
+        return cmd_host_add(ns)
+    if ns.command == "list":
+        return cmd_host_list()
+    if ns.command == "show":
+        return cmd_host_show(ns.name)
+    if ns.command == "show-key":
+        return cmd_host_show_key(ns.name)
+    if ns.command == "install-key":
+        return cmd_host_install_key(ns.name)
+    if ns.command == "test":
+        return cmd_host_test(ns.name)
+    if ns.command == "remove":
+        return cmd_host_remove(ns.name, yes=ns.yes, delete_key=ns.delete_key)
+
+    return 1
+
+
+def cmd_host_add(ns: argparse.Namespace) -> int:
+    ensure_dirs()
+
+    try:
+        validate_host_name(ns.name)
+    except ValueError as exc:
+        print(f"psync_host add: {exc}", file=sys.stderr)
+        return 1
+
+    hosts = load_hosts()
+    existing = next((host for host in hosts if host["name"] == ns.name), None)
+
+    if existing and not ns.force:
+        print(f"psync_host add: host already exists: {ns.name}", file=sys.stderr)
+        print("Use --force to replace it.", file=sys.stderr)
+        return 1
+
+    generated_key = False
+
+    if ns.identity_file:
+        identity_file = str(Path(ns.identity_file).expanduser().resolve())
+        if not Path(identity_file).exists():
+            print(
+                f"psync_host add: identity file not found: {identity_file}",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        identity_path = psync_keys_dir() / ns.name
+        identity_file = str(identity_path)
+        generated_key = True
+
+        if not identity_path.exists():
+            subprocess.run(
+                [
+                    "ssh-keygen",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-f",
+                    str(identity_path),
+                    "-C",
+                    f"psync-{ns.name}@{os.uname().nodename}-{dt.date.today().isoformat()}",
+                ],
+                check=True,
+            )
+            identity_path.chmod(0o600)
+            Path(str(identity_path) + ".pub").chmod(0o644)
+
+    host_record = {
+        "name": ns.name,
+        "host": ns.host,
+        "user": ns.user,
+        "port": ns.port,
+        "identity_file": identity_file,
+        "generated_key": generated_key,
+        "created_at": existing.get("created_at") if existing else now_iso(),
+        "updated_at": now_iso(),
+    }
+
+    hosts = [host for host in hosts if host["name"] != ns.name]
+    hosts.append(host_record)
+    save_hosts(hosts)
+
+    print(f"psync host added: {ns.name}")
+    print(f"SSH config: {psync_ssh_config_path()}")
+    print()
+    print("Public key:")
+    print(public_key_text(identity_file))
+    print()
+    print("Next steps:")
+    print(f"  psync_host install-key {ns.name}")
+    print(f"  psync_host test {ns.name}")
+
+    return 0
+
+
+def cmd_host_list() -> int:
+    hosts = load_hosts()
+
+    if not hosts:
+        print("No psync hosts configured.")
+        return 0
+
+    for host in sorted(hosts, key=lambda h: h["name"]):
+        port = f":{host['port']}" if host.get("port") else ""
+        generated = "generated" if host.get("generated_key") else "existing-key"
+        print(f"{host['name']:<20} {host['user']}@{host['host']}{port}  {generated}")
+
+    return 0
+
+
+def cmd_host_show(name: str) -> int:
+    host = host_by_name(name)
+    if host is None:
+        print(f"psync_host show: no such host: {name}", file=sys.stderr)
+        return 1
+
+    print(f"Name:          {host['name']}")
+    print(f"Host:          {host['host']}")
+    print(f"User:          {host['user']}")
+    print(f"Port:          {host.get('port') or ''}")
+    print(f"IdentityFile:  {host['identity_file']}")
+    print(f"Generated key: {host.get('generated_key', False)}")
+    print(f"Created:       {host.get('created_at')}")
+    print(f"Updated:       {host.get('updated_at')}")
+    return 0
+
+
+def cmd_host_show_key(name: str) -> int:
+    host = host_by_name(name)
+    if host is None:
+        print(f"psync_host show-key: no such host: {name}", file=sys.stderr)
+        return 1
+
+    print(public_key_text(host["identity_file"]))
+    return 0
+
+
+def cmd_host_install_key(name: str) -> int:
+    host = host_by_name(name)
+    if host is None:
+        print(f"psync_host install-key: no such host: {name}", file=sys.stderr)
+        return 1
+
+    pub = public_key_text(host["identity_file"]) + "\n"
+    target = f"{host['user']}@{host['host']}"
+
+    cmd = ["ssh"]
+    if host.get("port"):
+        cmd.extend(["-p", str(host["port"])])
+    cmd.append(target)
+    cmd.append(
+        "umask 077; "
+        "mkdir -p ~/.ssh; "
+        "touch ~/.ssh/authorized_keys; "
+        "tmp=$(mktemp); "
+        'cat > "$tmp"; '
+        'grep -qxF -f "$tmp" ~/.ssh/authorized_keys || cat "$tmp" >> ~/.ssh/authorized_keys; '
+        'rm -f "$tmp"; '
+        "chmod 700 ~/.ssh; "
+        "chmod 600 ~/.ssh/authorized_keys"
+    )
+
+    print(f"Installing public key on {target}.")
+    print("You may be prompted for the remote user's password once.")
+
+    proc = subprocess.run(cmd, input=pub, text=True)
+
+    if proc.returncode != 0:
+        print("psync_host install-key: failed.", file=sys.stderr)
+        return proc.returncode
+
+    print("Public key installed.")
+    return 0
+
+
+def cmd_host_test(name: str) -> int:
+    host = host_by_name(name)
+    if host is None:
+        print(f"psync_host test: no such host: {name}", file=sys.stderr)
+        return 1
+
+    write_psync_ssh_config(load_hosts())
+
+    proc = subprocess.run(
+        ["ssh", "-F", str(psync_ssh_config_path()), name, "true"],
+        text=True,
+    )
+
+    if proc.returncode == 0:
+        print(f"psync host OK: {name}")
+    else:
+        print(f"psync host failed: {name}", file=sys.stderr)
+
+    return proc.returncode
+
+
+def cmd_host_remove(name: str, *, yes: bool, delete_key: bool) -> int:
+    hosts = load_hosts()
+    host = next((item for item in hosts if item["name"] == name), None)
+
+    if host is None:
+        print(f"psync_host remove: no such host: {name}", file=sys.stderr)
+        return 1
+
+    if not yes:
+        print(f"Remove psync host {name}?")
+        print(f"  {host['user']}@{host['host']}")
+        reply = input("Continue? [y/N] ").strip().lower()
+        if reply not in {"y", "yes"}:
+            print("Cancelled.")
+            return 1
+
+    hosts = [item for item in hosts if item["name"] != name]
+    save_hosts(hosts)
+
+    if delete_key and host.get("generated_key"):
+        key = Path(host["identity_file"]).expanduser()
+        key.unlink(missing_ok=True)
+        Path(str(key) + ".pub").unlink(missing_ok=True)
+        print(f"Deleted generated key: {key}")
+
+    print(f"Removed psync host: {name}")
+    print(
+        "Note: this does not remove the public key from the remote authorized_keys file."
+    )
+    return 0
+
+
 def dispatch() -> int:
     name = Path(sys.argv[0]).name
     args = sys.argv[1:]
@@ -846,6 +1823,8 @@ def dispatch() -> int:
         return cmd_log(args)
     if name == "psync_remove":
         return cmd_remove(args)
+    if name == "psync_host":
+        return cmd_host(args)
     if name == "psync_internal_scheduler":
         return cmd_scheduler()
 

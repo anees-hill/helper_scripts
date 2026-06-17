@@ -1,0 +1,5 @@
+*.sh text eol=lf
+files/bin/* text eol=lf
+*.py text eol=lf
+*.vim text eol=lf
+*.conf text eol=lf
