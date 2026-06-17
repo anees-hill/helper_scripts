@@ -1804,7 +1804,7 @@ def cmd_host_remove(name: str, *, yes: bool, delete_key: bool) -> int:
 
 
 def dispatch() -> int:
-    name = Path(sys.argv[0]).name
+    name = os.environ.get("PSYNC_COMMAND_NAME") or Path(sys.argv[0]).name
     args = sys.argv[1:]
 
     if name == "psync":

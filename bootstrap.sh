@@ -490,6 +490,9 @@ install_psync() {
   local user_home
   user_home="$(home_for_user)"
 
+  local psync_app_dir
+  psync_app_dir="$user_home/.local/share/helper_scripts/psync"
+
   if [[ ! -f "$REPO_DIR/files/bin/psync" ]]; then
     echo "Missing file: files/bin/psync" >&2
     echo "Put the psync script there first." >&2
@@ -501,18 +504,44 @@ install_psync() {
     apt install -y rsync
   fi
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    apt update
-    apt install -y python3
-  fi
-
-  install -d -o "$TARGET_USER" -g "$TARGET_USER" "$user_home/.local/bin"
+  install -d -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$user_home/.local/bin" \
+    "$psync_app_dir"
 
   install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
     "$REPO_DIR/files/bin/psync" \
-    "$user_home/.local/bin/psync"
+    "$psync_app_dir/psync"
 
-  sed -i 's/\r$//' "$user_home/.local/bin/psync"
+  sed -i 's/\r$//' "$psync_app_dir/psync"
+
+  run_as_user '
+    set -Eeuo pipefail
+
+    export PATH="$HOME/.local/bin:$PATH"
+
+    if ! command -v uv >/dev/null 2>&1; then
+      echo "uv not found. Run bootstrap with --uv first, or use --simple before --psync." >&2
+      exit 1
+    fi
+
+    uv python install 3.11
+    uv venv --python 3.11 "$HOME/.local/share/helper_scripts/psync/.venv"
+
+    "$HOME/.local/share/helper_scripts/psync/.venv/bin/python" --version
+  '
+
+  cat > "$user_home/.local/bin/psync" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PSYNC_COMMAND_NAME="$(basename "$0")"
+
+exec "$HOME/.local/share/helper_scripts/psync/.venv/bin/python" \
+  "$HOME/.local/share/helper_scripts/psync/psync" "$@"
+EOF
+
+  chown "$TARGET_USER:$TARGET_USER" "$user_home/.local/bin/psync"
+  chmod 0755 "$user_home/.local/bin/psync"
 
   local cmd
   for cmd in \
@@ -533,6 +562,10 @@ install_psync() {
   record_component "psync"
 
   echo "Installed psync commands to $user_home/.local/bin"
+  echo "Real psync script:"
+  echo "  $psync_app_dir/psync"
+  echo "Python:"
+  echo "  $psync_app_dir/.venv/bin/python"
   echo "Start the scheduler as $TARGET_USER with:"
   echo "  psync_start"
 }
