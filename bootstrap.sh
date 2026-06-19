@@ -444,20 +444,56 @@ install_tmux() {
     echo "tmux already installed: $(command -v tmux)"
   fi
 
+  if ! command -v git >/dev/null 2>&1; then
+    apt update
+    apt install -y git
+  fi
+
   if [[ ! -f "$REPO_DIR/files/tmux/tmux.conf" ]]; then
     echo "Missing file: files/tmux/tmux.conf" >&2
     echo "Put your .tmux.conf there first." >&2
     exit 1
   fi
 
+  install -d -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$user_home/.tmux/plugins" \
+    "$user_home/.tmux/resurrect"
+
   install -m 0644 -o "$TARGET_USER" -g "$TARGET_USER" \
     "$REPO_DIR/files/tmux/tmux.conf" \
     "$user_home/.tmux.conf"
+
+  sed -i 's/\r$//' "$user_home/.tmux.conf"
+
+  run_as_user '
+    set -Eeuo pipefail
+
+    mkdir -p "$HOME/.tmux/plugins" "$HOME/.tmux/resurrect"
+
+    if [[ ! -d "$HOME/.tmux/plugins/tpm/.git" ]]; then
+      git clone https://github.com/tmux-plugins/tpm "$HOME/.tmux/plugins/tpm"
+    else
+      git -C "$HOME/.tmux/plugins/tpm" pull --ff-only || true
+    fi
+
+    if [[ -x "$HOME/.tmux/plugins/tpm/bin/install_plugins" ]]; then
+      "$HOME/.tmux/plugins/tpm/bin/install_plugins" || true
+    fi
+  '
 
   record_component "tmux"
 
   echo "Installed tmux config for $TARGET_USER:"
   echo "  $user_home/.tmux.conf"
+  echo
+  echo "Installed TPM:"
+  echo "  $user_home/.tmux/plugins/tpm"
+  echo
+  echo "After updating an existing tmux session, run:"
+  echo "  tmux source-file ~/.tmux.conf"
+  echo
+  echo "For a clean reload:"
+  echo "  tmux kill-server"
 }
 
 install_uv_tools() {
