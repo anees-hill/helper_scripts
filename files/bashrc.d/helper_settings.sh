@@ -28,13 +28,102 @@ alias ltd='eza -lh --sort=size --reverse --group'
 alias ltd5='ltd | head -n 5'
 alias ltda='eza -lh --sort=size --group'
 alias ltda5='ltda | head -n 5'
-alias gs='git status'
-alias gl='git log --oneline --graph --decorate --all'
 alias psa='ps aux | grep -v grep | grep -i'
 alias ve='source .venv/bin/activate'
 alias ports='sudo lsof -i -P -n'
 alias myip='curl -s ifconfig.me'
 alias oom="sudo journalctl -k -o short-iso -q | grep 'Killed process' | sed -E 's/^([0-9-]+ [0-9:]+).*Killed process ([0-9]+) \(([^)]+)\).*total-vm:([0-9]+)kB, anon-rss:([0-9]+)kB.*/\1 | pid:\2 | \3 | vm:\4kB | rss:\5kB/'"
+
+# git
+alias gs='git status'
+
+# Existing-style log
+alias gl='git log --oneline --graph --decorate --all'
+
+# gl + absolute commit datetime
+alias glt='git log --graph --decorate --all --date=format-local:"%Y-%m-%d %H:%M" --pretty=format:"%C(auto)%h%Creset %C(cyan)%ad%Creset %C(auto)%d%Creset %s"'
+
+# gl + relative commit time, e.g. "4 hours ago"
+alias glts='git log --graph --decorate --all --date=relative --pretty=format:"%C(auto)%h%Creset %C(cyan)%ar%Creset %C(auto)%d%Creset %s"'
+
+# gl + author
+alias glc='git log --graph --decorate --all --pretty=format:"%C(auto)%h%Creset %C(yellow)%an%Creset %C(auto)%d%Creset %s"'
+
+# gl + absolute datetime + author
+alias gltc='git log --graph --decorate --all --date=format-local:"%Y-%m-%d %H:%M" --pretty=format:"%C(auto)%h%Creset %C(cyan)%ad%Creset %C(yellow)%an%Creset %C(auto)%d%Creset %s"'
+alias glct='gltc'
+
+# gl + relative time + author
+alias gltsc='git log --graph --decorate --all --date=relative --pretty=format:"%C(auto)%h%Creset %C(cyan)%ar%Creset %C(yellow)%an%Creset %C(auto)%d%Creset %s"'
+alias glst='gltsc'
+
+# Recent branches
+alias gb='git branch --sort=-committerdate --format="%(committerdate:relative) %(refname:short)"'
+
+_git_base_ref() {
+  local ref
+
+  for ref in '@{upstream}' origin/HEAD origin/main origin/master main master origin/develop develop; do
+    if git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+      echo "$ref"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+gmb() {
+  local base_ref="${1:-}"
+  local base_sha=""
+
+  if [[ -z "$base_ref" ]]; then
+    base_ref="$(_git_base_ref)" || {
+      echo "gmb: could not find upstream/main/master/develop base ref" >&2
+      return 1
+    }
+  fi
+
+  base_sha="$(git merge-base HEAD "$base_ref")" || return 1
+  echo "$base_sha"
+}
+
+glb() {
+  local base_ref="${1:-}"
+  local base_sha=""
+
+  if [[ -z "$base_ref" ]]; then
+    base_ref="$(_git_base_ref)" || {
+      echo "glb: could not find upstream/main/master/develop base ref" >&2
+      echo "Usage: glb [base-ref]" >&2
+      echo "Example: glb main" >&2
+      return 1
+    }
+  fi
+
+  base_sha="$(git merge-base HEAD "$base_ref")" || return 1
+
+  echo "Branch: $(git branch --show-current)"
+  echo "Base:   $base_sha ($base_ref)"
+  echo
+
+  git log --oneline --graph --decorate "$base_sha..HEAD"
+  echo
+  echo "Branched from:"
+  git log -1 --oneline --decorate "$base_sha"
+}
+
+gshowbase() {
+  git show "$(gmb "$@")"
+}
+
+gdiffbase() {
+  git diff "$(gmb "$@")"..HEAD
+}
+
+glogbase() {
+  git log --oneline --graph --decorate "$(gmb "$@")"..HEAD
+}
 
 # Resource use
 alias topcpu='ps -eo pid,%cpu,args --sort=-%cpu | head -n 11'
