@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v base64 >/dev/null 2>&1; then
+  echo "copy: base64 command not found" >&2
+  exit 1
+fi
+
+if [[ ! -w /dev/tty ]]; then
+  echo "copy: /dev/tty is not writable; OSC52 clipboard needs an interactive terminal" >&2
+  exit 1
+fi
+
+if base64 --help 2>/dev/null | grep -q -- '-w'; then
+  data="$(base64 -w 0)"
+else
+  data="$(base64 | tr -d '\n')"
+fi
+
+printf '\033]52;c;%s\a' "$data" > /dev/tty
