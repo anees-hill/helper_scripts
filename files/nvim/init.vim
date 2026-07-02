@@ -4,13 +4,34 @@ set termguicolors
 set updatetime=250
 set signcolumn=yes
 set hidden
-set clipboard=unnamedplus
 set expandtab
 set shiftwidth=4
 set tabstop=4
 set smartindent
 
 let mapleader = " "
+
+" Clipboard over SSH/tmux using OSC52.
+" This lets yy, "+yy and :%y+ copy back to the local terminal clipboard.
+lua << EOF
+local ok, osc52 = pcall(require, 'vim.ui.clipboard.osc52')
+
+if ok then
+  vim.g.clipboard = {
+    name = 'OSC52',
+    copy = {
+      ['+'] = osc52.copy('+'),
+      ['*'] = osc52.copy('*'),
+    },
+    paste = {
+      ['+'] = false,
+      ['*'] = false,
+    },
+  }
+end
+EOF
+
+set clipboard+=unnamedplus
 
 " Let terminal background show through
 highlight Normal guibg=NONE ctermbg=NONE

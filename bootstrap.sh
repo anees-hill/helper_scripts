@@ -185,6 +185,11 @@ install_core() {
     exit 1
   fi
 
+  if [[ ! -f "$REPO_DIR/files/bin/copy" ]]; then
+    echo "Missing file: files/bin/copy" >&2
+    exit 1
+  fi
+
   if ! command -v python3 >/dev/null 2>&1; then
     apt update
     apt install -y python3
@@ -197,6 +202,12 @@ install_core() {
     "$user_home/.local/bin/pver"
 
   sed -i 's/\r$//' "$user_home/.local/bin/pver"
+
+  install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$REPO_DIR/files/bin/copy" \
+    "$user_home/.local/bin/copy"
+
+  sed -i 's/\r$//' "$user_home/.local/bin/copy"
 
   local cmd
   for cmd in pregister pupdate; do
@@ -667,6 +678,32 @@ EOF
 install_visidata() {
   ensure_user_exists
 
+  local user_home
+  user_home="$(home_for_user)"
+
+  if [[ ! -f "$REPO_DIR/files/bin/copy" ]]; then
+    echo "Missing file: files/bin/copy" >&2
+    exit 1
+  fi
+
+  install -d -o "$TARGET_USER" -g "$TARGET_USER" "$user_home/.local/bin"
+
+  install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$REPO_DIR/files/bin/copy" \
+    "$user_home/.local/bin/copy"
+
+  sed -i 's/\r$//' "$user_home/.local/bin/copy"
+
+  cat > "$user_home/.visidatarc" <<EOF
+# ~/.visidatarc
+# Managed by helper_scripts.
+# Copy from VisiData over SSH/tmux using OSC52.
+options.clipboard_copy_cmd = "$user_home/.local/bin/copy"
+EOF
+
+  chown "$TARGET_USER:$TARGET_USER" "$user_home/.visidatarc"
+  chmod 0644 "$user_home/.visidatarc"
+
   run_as_user '
     set -Eeuo pipefail
 
@@ -688,7 +725,13 @@ install_visidata() {
       echo "Open a new shell, or check that ~/.local/bin is on PATH." >&2
     fi
   '
+
   record_component "visidata"
+
+  echo "Installed VisiData clipboard config:"
+  echo "  $user_home/.visidatarc"
+  echo "Copy command:"
+  echo "  $user_home/.local/bin/copy"
 }
 
 while [[ $# -gt 0 ]]; do

@@ -129,6 +129,12 @@ ptail() {
 pcopy() {
   _pensure
 
+  if [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}${TMUX:-}" ]] && command -v copy >/dev/null 2>&1; then
+    copy < "$PROMPT_XML_FILE"
+    echo "Copied $(du -k "$PROMPT_XML_FILE" | cut -f1) KB using OSC52 terminal clipboard."
+    return 0
+  fi
+
   if command -v wl-copy >/dev/null 2>&1; then
     wl-copy < "$PROMPT_XML_FILE"
     echo "Copied $(du -k "$PROMPT_XML_FILE" | cut -f1) KB using wl-copy."
@@ -176,6 +182,20 @@ pcopy() {
   return 1
 }
 
+pcopys() {
+  _pensure
+
+  if ! command -v copy >/dev/null 2>&1; then
+    echo "pcopys: copy command not found." >&2
+    echo "Install helper_scripts core, or run:" >&2
+    echo "  sudo bash bootstrap.sh --core --user $USER" >&2
+    return 1
+  fi
+
+  copy < "$PROMPT_XML_FILE"
+  echo "Copied $(du -k "$PROMPT_XML_FILE" | cut -f1) KB using OSC52 terminal clipboard."
+}
+
 _pensure() {
   mkdir -p "$(dirname "$PROMPT_XML_FILE")"
   mkdir -p "$PROMPT_TOOLS_DIR"
@@ -218,8 +238,10 @@ _pcopy_osc52() {
     return 1
   fi
 
-  # OSC52 is often the best option for copying from an SSH session
-  # into the local terminal clipboard. It depends on terminal support.
+  if [[ ! -w /dev/tty ]]; then
+    return 1
+  fi
+
   local encoded
 
   if base64 --help 2>/dev/null | grep -q -- '-w'; then
@@ -232,7 +254,7 @@ _pcopy_osc52() {
     return 1
   fi
 
-  printf '\033]52;c;%s\a' "$encoded"
+  printf '\033]52;c;%s\a' "$encoded" > /dev/tty
   return 0
 }
 
