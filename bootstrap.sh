@@ -667,9 +667,15 @@ EOF
   chown "$TARGET_USER:$TARGET_USER" "$user_home/.local/bin/apicurl"
   chmod 0755 "$user_home/.local/bin/apicurl"
 
+  # Preferred command name for the expanded managed CLI. Keep apicurl for
+  # compatibility with earlier helper_scripts installs.
+  ln -sf "$user_home/.local/bin/apicurl" "$user_home/.local/bin/curlapi"
+  chown -h "$TARGET_USER:$TARGET_USER" "$user_home/.local/bin/curlapi" 2>/dev/null || true
+
   record_component "apicurl"
 
-  echo "Installed apicurl:"
+  echo "Installed curlapi/apicurl:"
+  echo "  $user_home/.local/bin/curlapi"
   echo "  $user_home/.local/bin/apicurl"
   echo "Real script:"
   echo "  $apicurl_app_dir/apicurl.py"
