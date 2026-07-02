@@ -1072,9 +1072,6 @@ def due_time(job: dict[str, Any]) -> dt.datetime:
             tzinfo=now_local.tzinfo,
         )
 
-        while candidate <= now_local:
-            candidate += dt.timedelta(days=days)
-
         return candidate.astimezone(dt.timezone.utc)
 
     if last_run is None:
