@@ -115,6 +115,79 @@ local view = require('iron.view')
 local common = require('iron.fts.common')
 
 -- -------------------------------------------------------------------
+-- Iron fullscreen toggle
+--
+-- <leader>z:
+--   - if an Iron/terminal window is visible, show it fullscreen in a tab
+--   - if already fullscreen, close that temporary tab
+--
+-- This deliberately does NOT call IronFocus, because IronFocus may try to
+-- create a REPL and can trigger Iron command-provider issues.
+-- -------------------------------------------------------------------
+
+local iron_fullscreen = {
+  tab = nil,
+  source_win = nil,
+}
+
+local function find_visible_terminal()
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    local buf = vim.api.nvim_win_get_buf(win)
+
+    if vim.bo[buf].buftype == "terminal" then
+      return win, buf
+    end
+  end
+
+  return nil, nil
+end
+
+local function toggle_iron_fullscreen()
+  local current_tab = vim.api.nvim_get_current_tabpage()
+
+  -- If we are in the temporary fullscreen tab, close only that tab.
+  if iron_fullscreen.tab ~= nil
+      and vim.api.nvim_tabpage_is_valid(iron_fullscreen.tab)
+      and current_tab == iron_fullscreen.tab then
+    vim.cmd("tabclose")
+
+    if iron_fullscreen.source_win ~= nil
+        and vim.api.nvim_win_is_valid(iron_fullscreen.source_win) then
+      vim.api.nvim_set_current_win(iron_fullscreen.source_win)
+    end
+
+    iron_fullscreen.tab = nil
+    iron_fullscreen.source_win = nil
+    return
+  end
+
+  local term_win, term_buf = find_visible_terminal()
+
+  if term_buf == nil then
+    print("No visible Iron/terminal window found. Open Iron first with <leader>rr.")
+    return
+  end
+
+  iron_fullscreen.source_win = vim.api.nvim_get_current_win()
+
+  vim.api.nvim_set_current_win(term_win)
+  vim.cmd("tab split")
+
+  iron_fullscreen.tab = vim.api.nvim_get_current_tabpage()
+
+  vim.api.nvim_set_current_buf(term_buf)
+  vim.cmd("startinsert")
+end
+
+vim.keymap.set("n", "<leader>z", toggle_iron_fullscreen, {
+  desc = "Toggle Iron fullscreen",
+})
+
+vim.keymap.set("t", "<C-\\>", [[<C-\><C-n>]], {
+  desc = "Exit terminal mode",
+})
+
+-- -------------------------------------------------------------------
 -- Harpoon quick file navigation
 -- -------------------------------------------------------------------
 
@@ -763,19 +836,6 @@ end
 
 local r_cmd = [[/usr/local/bin/R]]
 
-local function toggle_r()
-  local r453 = [[/usr/local/bin/R]]
-  local r443 = [[/bin/R]]
-
-  if r_cmd == r453 then
-    r_cmd = r443
-    print("R set to 4.4.3")
-  else
-    r_cmd = r453
-    print("R set to 4.5.3")
-  end
-end
-
 iron.setup({
   config = {
     scratch_repl = true,
@@ -785,9 +845,7 @@ iron.setup({
         format = require('iron.fts.common').bracketed_paste,
       },
       r = {
-        command = function()
-          return { r_cmd }
-        end,
+        command = { r_cmd },
       },
     },
     repl_filetype = function(bufnr, ft)
@@ -818,7 +876,6 @@ iron.setup({
     },
 })
 
-vim.keymap.set('n', '<leader>rt', toggle_r)		
 vim.keymap.set('n', '<leader>rf', '<cmd>IronFocus<CR>')
 vim.keymap.set('n', '<leader>rh', '<cmd>IronHide<CR>')
 

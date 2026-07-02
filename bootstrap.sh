@@ -12,6 +12,7 @@ DO_BASHRC=0
 DO_CORE=0
 DO_PWRAP=0
 DO_PSYNC=0
+DO_APICURL=0
 DO_NVIM=0
 DO_TOOLS=0
 DO_TMUX=0
@@ -26,7 +27,7 @@ Profiles:
   --simple         Create user, install apt tools, uv, SSH key, core helpers, bashrc settings, uv tools.
                    Does not install pwrap or nvim.
 
-  --ide            Everything in --simple, plus pwrap, nvim, tmux, core helpers and Visidata.
+  --ide            Everything in --simple, plus pwrap, nvim, tmux, apicurl, core helpers and Visidata.
 
 Individual options:
   --user NAME      Target user. Default: samane.
@@ -38,6 +39,7 @@ Individual options:
   --core          Install pver, pregister and pupdate.
   --pwrap         Install pwrap prompt tools.
   --psync         Install psync rsync schedule helper.
+  --apicurl       Install apicurl OpenAPI curl scratchpad generator.
   --nvim          Install Neovim AppImage and init.vim.
   --tool         Install Python/dev tools via uv.
   --tmux          Install tmux and populate ~/.tmux.conf.
@@ -606,6 +608,62 @@ EOF
   echo "  psync_start"
 }
 
+install_apicurl() {
+  ensure_user_exists
+
+  local user_home
+  user_home="$(home_for_user)"
+
+  local apicurl_app_dir
+  apicurl_app_dir="$user_home/.local/share/helper_scripts/apicurl"
+
+  if [[ ! -f "$REPO_DIR/files/bin/apicurl.py" ]]; then
+    echo "Missing file: files/bin/apicurl.py" >&2
+    exit 1
+  fi
+
+  install -d -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$user_home/.local/bin" \
+    "$apicurl_app_dir"
+
+  install -m 0755 -o "$TARGET_USER" -g "$TARGET_USER" \
+    "$REPO_DIR/files/bin/apicurl.py" \
+    "$apicurl_app_dir/apicurl.py"
+
+  sed -i 's/\r$//' "$apicurl_app_dir/apicurl.py"
+
+  run_as_user '
+    set -Eeuo pipefail
+
+    export PATH="$HOME/.local/bin:$PATH"
+
+    if ! command -v uv >/dev/null 2>&1; then
+      echo "uv not found. Run bootstrap with --uv first, or use --ide." >&2
+      exit 1
+    fi
+
+    uv python install 3.11
+    uv run python "$HOME/.local/share/helper_scripts/apicurl/apicurl.py" --help >/dev/null
+  '
+
+  cat > "$user_home/.local/bin/apicurl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec uv run python "$HOME/.local/share/helper_scripts/apicurl/apicurl.py" "$@"
+EOF
+
+  chown "$TARGET_USER:$TARGET_USER" "$user_home/.local/bin/apicurl"
+  chmod 0755 "$user_home/.local/bin/apicurl"
+
+  record_component "apicurl"
+
+  echo "Installed apicurl:"
+  echo "  $user_home/.local/bin/apicurl"
+  echo "Real script:"
+  echo "  $apicurl_app_dir/apicurl.py"
+}
+
 install_visidata() {
   ensure_user_exists
 
@@ -664,6 +722,7 @@ while [[ $# -gt 0 ]]; do
       DO_CORE=1
       DO_TOOLS=1
       DO_PWRAP=1
+      DO_APICURL=1
       DO_NVIM=1
       DO_TMUX=1
       DO_VISIDATA=1
@@ -710,6 +769,11 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
 
+    --apicurl)
+      DO_APICURL=1
+      shift
+      ;;
+
     --nvim)
       DO_NVIM=1
       shift
@@ -743,7 +807,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if (( DO_CREATE_USER + DO_APT + DO_UV + DO_SSH_KEY + DO_BASHRC + DO_CORE + DO_PWRAP + DO_PSYNC + DO_NVIM + DO_TOOLS + DO_TMUX + DO_VISIDATA == 0 )); then
+if (( DO_CREATE_USER + DO_APT + DO_UV + DO_SSH_KEY + DO_BASHRC + DO_CORE + DO_PWRAP + DO_PSYNC + DO_APICURL + DO_NVIM + DO_TOOLS + DO_TMUX + DO_VISIDATA == 0 )); then
   usage
   exit 1
 fi
@@ -758,6 +822,7 @@ need_root
 [[ "$DO_CORE" -eq 1 ]] && install_core
 [[ "$DO_PWRAP" -eq 1 ]] && install_pwrap
 [[ "$DO_PSYNC" -eq 1 ]] && install_psync
+[[ "$DO_APICURL" -eq 1 ]] && install_apicurl
 [[ "$DO_NVIM" -eq 1 ]] && install_nvim
 [[ "$DO_TMUX" -eq 1 ]] && install_tmux
 [[ "$DO_TOOLS" -eq 1 ]] && install_uv_tools
